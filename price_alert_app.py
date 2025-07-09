@@ -159,17 +159,24 @@ if st.button("Agregar a lista"):
 st.markdown("## 📈 Lista de seguimiento – precios en tiempo real")
 if watchlist:
     headers = ["Ticker", "Tipo", "Condición", "Precio actual", "Estado", ""]
-    st.columns([1.2, .8, 1.5, 1.2, .8, .6]); [c.markdown(f"**{h}**") for c,h in zip(st.columns([1.2, .8, 1.5, 1.2, .8, .6]), headers)]
+    header_cols = st.columns([1.2, 0.8, 1.5, 1.2, 0.8, 0.6])
+    for col, h in zip(header_cols, headers):
+        col.markdown(f"**{h}**")
+
     for idx, it in enumerate(watchlist):
-        cols = st.columns([1.2, .8, 1.5, 1.2, .8, .6])
-        cols[0].markdown(it["symbol"]); cols[1].markdown(it["type"])
+        cols = st.columns([1.2, 0.8, 1.5, 1.2, 0.8, 0.6])
+        cols[0].markdown(it["symbol"])
+        cols[1].markdown(it["type"])
         cols[2].markdown(("≥" if it["direction"] == "above" else "≤") + f" {it['target']}")
         cols[3].markdown(f"{it['last']:.2f}" if it.get("last") else "…")
         cols[4].markdown("🟢 Activa" if not it.get("triggered") else "🔔 Disparada")
         if cols[5].button("🗑️", key=f"del_{idx}"):
-            del watchlist[idx]; save_json(WATCHLIST_PATH, watchlist); st.experimental_rerun()
+            del watchlist[idx]
+            save_json(WATCHLIST_PATH, watchlist)
+            st.experimental_rerun()
+
     st.caption(f"Última actualización: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
 else:
     st.info("Aún no hay activos en seguimiento.")
 
-st.caption("App Streamlit © 2025 – Fantastic Plastik")
+st.caption("App Streamlit © 2025 – Fantastic Plastik") © 2025 – Fantastic Plastik")
