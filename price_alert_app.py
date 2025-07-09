@@ -403,25 +403,25 @@ with st.sidebar:
         "Cache (minutos)", 
         min_value=1, 
         max_value=60, 
-        value=int(config["cache_duration_minutes"])
+        value=int(config.get("cache_duration_minutes", 2))
     )
     
     config["notification_cooldown"] = st.number_input(
         "Cooldown notificaciones (seg)", 
         min_value=60, 
         max_value=3600, 
-        value=int(config["notification_cooldown"])
+        value=int(config.get("notification_cooldown", 300))
     )
     
     st.markdown("---")
     
     # Configuración SMTP
     st.subheader("📧 Configuración Email")
-    config["smtp_host"] = st.text_input("Host SMTP", value=config["smtp_host"])
-    config["smtp_port"] = st.number_input("Puerto SMTP", value=int(config["smtp_port"]))
-    config["smtp_user"] = st.text_input("Usuario", value=config["smtp_user"])
-    config["smtp_pass"] = st.text_input("Contraseña", value=config["smtp_pass"], type="password")
-    config["email_to"] = st.text_input("Destinatario", value=config["email_to"])
+    config["smtp_host"] = st.text_input("Host SMTP", value=config.get("smtp_host", "smtp.gmail.com"))
+    config["smtp_port"] = st.number_input("Puerto SMTP", value=int(config.get("smtp_port", 465)))
+    config["smtp_user"] = st.text_input("Usuario", value=config.get("smtp_user", ""))
+    config["smtp_pass"] = st.text_input("Contraseña", value=config.get("smtp_pass", ""), type="password")
+    config["email_to"] = st.text_input("Destinatario", value=config.get("email_to", ""))
     
     # Botones de acción
     col1, col2 = st.columns(2)
