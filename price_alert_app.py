@@ -1,12 +1,20 @@
 """
-Price Alert App – Alpha Vantage + CoinGecko
+Price Alert App – Alpha Vantage + CoinGecko (v2)
 ------------------------------------------------
-Aplicación Streamlit orientada a usuarios sin experiencia técnica.
-Ahora usa **Alpha Vantage** para acciones (plan free) y permite:
-* Definir cuántas veces por día se chequea el precio (1‑1440).
-* Enviar un **correo de prueba** para verificar la configuración.
-Requisitos: Python 3.9+, `pip install streamlit requests`.
-Ejecución: `streamlit run price_alert_app.py`
+Ahora con **lista en vivo**: la tabla de seguimiento se refresca automáticamente a la frecuencia que elijas.
+* Alpha Vantage para acciones, CoinGecko para cripto.
+* Chequeos por día configurables (1‑1440) ➜ autorefresh del frontend.
+* Botón de correo de prueba para SMTP.
+
+Requisitos
+----------
+```bash
+pip install streamlit requests streamlit-autorefresh
+```
+Ejecución:
+```bash
+streamlit run price_alert_app.py
+```
 """
 
 import os
@@ -18,16 +26,17 @@ from typing import Dict, List
 
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 from email.message import EmailMessage
 import smtplib
 import ssl
 
-# ------------- Rutas y defaults -------------
+# -------- Paths & defaults --------
 CONFIG_PATH = "config.json"
 WATCHLIST_PATH = "watchlist.json"
 DEFAULT_CONFIG = {
-    "av_key": "",          # Alpha Vantage API key
-    "checks_per_day": 1440,  # 1440 = cada 60 s
+    "av_key": "",            # Alpha Vantage API key
+    "checks_per_day": 1440,    # 1440 = cada 60 s
     "smtp_host": "smtp.gmail.com",
     "smtp_port": 465,
     "smtp_user": "",
@@ -42,7 +51,7 @@ CRYPTO_SYMBOL_MAP = {
     "sol": "solana",
 }
 
-# ------------- Helpers de persistencia -------------
+# -------- Persistence helpers --------
 
 def load_json(path: str, default):
     if os.path.exists(path):
@@ -57,14 +66,13 @@ def save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-# ------------- Cargar configuración y lista -------------
+# -------- Load config & watchlist --------
 config: Dict = load_json(CONFIG_PATH, DEFAULT_CONFIG)
 watchlist: List[Dict] = load_json(WATCHLIST_PATH, [])
 
-# ------------- Funciones de precio -------------
+# -------- Market price functions --------
 
 def get_stock_price(symbol: str) -> float:
-    """Último precio usando Alpha Vantage (GLOBAL_QUOTE)."""
     if not config["av_key"]:
         raise ValueError("Falta Alpha Vantage API key en Configuración.")
     url = (
@@ -94,7 +102,7 @@ def get_crypto_price(symbol: str) -> float:
 def current_price(item: Dict) -> float:
     return get_stock_price(item["symbol"]) if item["type"] == "stock" else get_crypto_price(item["symbol"])
 
-# ------------- Envío de email -------------
+# -------- Email helpers --------
 
 def send_email(subject: str, body: str):
     if not all([config["smtp_user"], config["smtp_pass"], config["email_to"]]):
@@ -115,45 +123,46 @@ def send_email(subject: str, body: str):
         st.error(f"Error enviando mail: {e}")
         return False
 
-# ------------- Hilo de alertas -------------
+# -------- Alert checking thread --------
 
 def check_alerts():
     while True:
         refresh_seconds = max(10, int(86400 / config.get("checks_per_day", 1440)))
-        triggered = []
         for item in watchlist:
             try:
                 price = current_price(item)
                 item["last"] = price
                 cond_met = price >= item["target"] if item["direction"] == "above" else price <= item["target"]
                 if cond_met and not item.get("triggered", False):
-                    cond = "≥" if item["direction"] == "above" else "≤"
-                    subject = f"Alerta {item['symbol'].upper()} {cond} {item['target']}"
+                    cond_symbol = "≥" if item["direction"] == "above" else "≤"
+                    subject = f"Alerta {item['symbol'].upper()} {cond_symbol} {item['target']}"
                     body = (
                         f"Ticker: {item['symbol'].upper()}\n"
                         f"Precio actual: {price:.2f} USD\n"
-                        f"Hora: {datetime.utcnow()} UTC"
+                        f"Hora: {datetime.utcnow()} UTC"
                     )
                     send_email(subject, body)
                     item["triggered"] = True
-                    triggered.append(item["symbol"])
             except Exception as e:
                 item["error"] = str(e)
-        if triggered:
-            save_json(WATCHLIST_PATH, watchlist)
+        save_json(WATCHLIST_PATH, watchlist)
         time.sleep(refresh_seconds)
 
-# Lanzar la thread una sola vez
+# Launch thread once
 if "alerts_thread" not in st.session_state:
     threading.Thread(target=check_alerts, daemon=True).start()
     st.session_state["alerts_thread"] = True
 
-# ------------- UI (Streamlit) -------------
+# -------- UI (Streamlit) --------
+# Autorefresh interval based on checks_per_day
+refresh_ms = max(10, int(86400000 / config.get("checks_per_day", 1440)))
+st_autorefresh(interval=refresh_ms, key="datarefresh")
+
 st.set_page_config(page_title="⏰ Price Alerts", layout="wide", initial_sidebar_state="expanded")
 
-st.title("⏰ Price Alerts – Acciones & Cripto")
+st.title("⏰ Price Alerts – Acciones & Cripto (en vivo)")
 
-# --- Sidebar Configuración ---
+# ---- Sidebar Config ----
 with st.sidebar:
     st.header("⚙️ Configuración")
     config["av_key"] = st.text_input("Alpha Vantage API Key", value=config["av_key"], type="password")
@@ -171,24 +180,23 @@ with st.sidebar:
             save_json(CONFIG_PATH, config)
             st.success("Configuración guardada ✔️")
     with colB:
-        if st.button("📧 Enviar correo de prueba"):
-            ok = send_email("Test Price Alerts", "Este es un correo de prueba desde tu app Price Alerts.")
-            if ok:
-                st.success("Correo de prueba enviado ✔️")
+        if st.button("📧 Correo de prueba"):
+            if send_email("Test Price Alerts", "Correo de prueba de Price Alerts."):
+                st.success("Enviado ✔️")
 
-# ------------- Sección: agregar activo -------------
-st.markdown("## Agregar activo a seguimiento")
+# ---- Add asset ----
+st.markdown("## ➕ Agregar activo a seguimiento")
 col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 with col1:
     symbol = st.text_input("Ticker / Símbolo", placeholder="AAPL o BTC")
 with col2:
-    asset_type = st.selectbox("Tipo", ["stock", "crypto"])
+    asset_type = st.selectbox("Tipo", ["stock", "crypto"], index=0)
 with col3:
     direction = st.selectbox("Condición", ["above", "below"], index=0)
 with col4:
-    target = st.number_input("Precio USD", min_value=0.0, step=0.01)
+    target = st.number_input("Precio USD", min_value=0.01, step=0.01)
 
-if st.button("➕ Agregar"):
+if st.button("Agregar a lista"):
     if symbol and target > 0:
         watchlist.append(
             {
@@ -201,26 +209,27 @@ if st.button("➕ Agregar"):
             }
         )
         save_json(WATCHLIST_PATH, watchlist)
-        st.success(f"{symbol.upper()} agregado a la lista")
+        st.success(f"{symbol.upper()} agregado")
     else:
-        st.error("Completa símbolo y precio objetivo > 0")
+        st.error("Completa símbolo y precio objetivo válido")
 
-# ------------- Tabla de seguimiento -------------
-st.markdown("## 📝 Lista de seguimiento")
+# ---- Live watchlist ----
+st.markdown("## 📈 Lista de seguimiento – precios en tiempo real")
 if watchlist:
-    table = []
+    live_table = []
     for item in watchlist:
-        table.append(
+        live_table.append(
             {
                 "Ticker": item["symbol"],
                 "Tipo": item["type"],
                 "Condición": ("≥" if item["direction"] == "above" else "≤") + f" {item['target']}",
-                "Último": f"{item['last']:.2f}" if item.get("last") else "-",
+                "Precio actual": f"{item['last']:.2f}" if item.get("last") else "…",
                 "Estado": "🟢 Activa" if not item.get("triggered") else "🔔 Disparada",
                 "Error": item.get("error", ""),
             }
         )
-    st.table(table)
+    st.dataframe(live_table, use_container_width=True)
+    st.caption(f"Última actualización: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
 else:
     st.info("Aún no hay activos en seguimiento.")
 
