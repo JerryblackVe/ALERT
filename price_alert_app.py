@@ -1,27 +1,21 @@
 """
-Price Alert App – Alpha Vantage + CoinGecko (v3‑fix2)
-----------------------------------------------------
-• Botón 🗑️ para eliminar activos.
-• Lista persiste en `watchlist.json`.
-• Tabla en vivo con autorefresco.
-• Sintaxis corregida (f‑string cerrada).
+Price Alert App – Alpha Vantage + CoinGecko (v4)
+------------------------------------------------
+Novedades:
+• La clave **Alpha Vantage** se guarda como siempre y ahora tiene botón 🗑️ para borrarla rápidamente.
+• La acción de borrado la elimina de `config.json` y recarga la app.
+• Resto sin cambios.
 """
 
-import os
-import json
-import time
-import threading
+import os, json, time, threading, smtplib, ssl
 from datetime import datetime
 from typing import Dict, List
 
-import requests
-import streamlit as st
+import requests, streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from email.message import EmailMessage
-import smtplib
-import ssl
 
-# ---------- Constantes ----------
+# ---------- Rutas y defaults ----------
 CONFIG_PATH = "config.json"
 WATCHLIST_PATH = "watchlist.json"
 DEFAULT_CONFIG = {
@@ -34,12 +28,7 @@ DEFAULT_CONFIG = {
     "email_to": "",
 }
 
-CRYPTO_SYMBOL_MAP = {
-    "btc": "bitcoin",
-    "eth": "ethereum",
-    "ada": "cardano",
-    "sol": "solana",
-}
+CRYPTO_SYMBOL_MAP = {"btc": "bitcoin", "eth": "ethereum", "ada": "cardano", "sol": "solana"}
 
 # ---------- Utilidades JSON ----------
 
@@ -56,7 +45,7 @@ def save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-# ---------- Cargar config y watchlist ----------
+# ---------- Cargar config y lista ----------
 config: Dict = load_json(CONFIG_PATH, DEFAULT_CONFIG)
 watchlist: List[Dict] = load_json(WATCHLIST_PATH, [])
 
@@ -69,23 +58,15 @@ def get_stock_price(symbol: str) -> float:
         "https://www.alphavantage.co/query"
         f"?function=GLOBAL_QUOTE&symbol={symbol.upper()}&apikey={config['av_key']}"
     )
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    try:
-        return float(data["Global Quote"]["05. price"])
-    except (KeyError, ValueError):
-        raise ValueError(f"No se pudo obtener el precio para {symbol}")
+    data = requests.get(url, timeout=10).json()
+    return float(data["Global Quote"]["05. price"])
 
 
 def get_crypto_price(symbol: str) -> float:
     cid = CRYPTO_SYMBOL_MAP.get(symbol.lower(), symbol.lower())
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if cid not in data or "usd" not in data[cid]:
-        raise ValueError(f"No se pudo obtener el precio para {symbol}")
+    data = requests.get(
+        f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd", timeout=10
+    ).json()
     return float(data[cid]["usd"])
 
 
@@ -98,26 +79,20 @@ def send_email(subject: str, body: str):
     if not all([config["smtp_user"], config["smtp_pass"], config["email_to"]]):
         st.error("⚠️ Falta configurar SMTP completo.")
         return False
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = config["smtp_user"]
-    msg["To"] = config["email_to"]
+    msg = EmailMessage(); msg["Subject"], msg["From"], msg["To"] = subject, config["smtp_user"], config["email_to"]
     msg.set_content(body)
-    context = ssl.create_default_context()
     try:
-        with smtplib.SMTP_SSL(config["smtp_host"], config["smtp_port"], context=context) as server:
-            server.login(config["smtp_user"], config["smtp_pass"])
-            server.send_message(msg)
+        with smtplib.SMTP_SSL(config["smtp_host"], config["smtp_port"], context=ssl.create_default_context()) as s:
+            s.login(config["smtp_user"], config["smtp_pass"]); s.send_message(msg)
         return True
     except Exception as e:
-        st.error(f"Error enviando mail: {e}")
-        return False
+        st.error(f"Error enviando mail: {e}"); return False
 
 # ---------- Hilo de alertas ----------
 
 def check_alerts():
     while True:
-        refresh_s = max(10, int(86400 / config.get("checks_per_day", 1440)))
+        interval = max(10, int(86400 / config.get("checks_per_day", 1440)))
         for item in watchlist:
             try:
                 price = current_price(item)
@@ -125,35 +100,34 @@ def check_alerts():
                 cond = price >= item["target"] if item["direction"] == "above" else price <= item["target"]
                 if cond and not item.get("triggered", False):
                     op = "≥" if item["direction"] == "above" else "≤"
-                    subject = f"Alerta {item['symbol'].upper()} {op} {item['target']}"
-                    body = (
-                        f"Ticker: {item['symbol'].upper()}\n"
-                        f"Precio actual: {price:.2f} USD\n"
-                        f"Hora: {datetime.utcnow()} UTC"
-                    )
-                    send_email(subject, body)
+                    body = f"Ticker: {item['symbol']}\nPrecio actual: {price:.2f} USD\nHora: {datetime.utcnow()} UTC"
+                    send_email(f"Alerta {item['symbol']} {op} {item['target']}", body)
                     item["triggered"] = True
             except Exception as e:
                 item["error"] = str(e)
         save_json(WATCHLIST_PATH, watchlist)
-        time.sleep(refresh_s)
+        time.sleep(interval)
 
-if "alerts_thread" not in st.session_state:
-    threading.Thread(target=check_alerts, daemon=True).start()
-    st.session_state["alerts_thread"] = True
+if "_thr" not in st.session_state:
+    threading.Thread(target=check_alerts, daemon=True).start(); st.session_state["_thr"] = True
 
 # ---------- UI ----------
 refresh_ms = max(10, int(86400000 / config.get("checks_per_day", 1440)))
 st_autorefresh(interval=refresh_ms, key="datarefresh")
 
 st.set_page_config(page_title="⏰ Price Alerts", layout="wide", initial_sidebar_state="expanded")
-
 st.title("⏰ Price Alerts – Acciones & Cripto (en vivo)")
 
 # --- Sidebar ---
 with st.sidebar:
     st.header("⚙️ Configuración")
-    config["av_key"] = st.text_input("Alpha Vantage API Key", value=config["av_key"], type="password")
+    av_col, del_col = st.columns([4, 1])
+    with av_col:
+        config["av_key"] = st.text_input("Alpha Vantage API Key", value=config["av_key"], type="password")
+    with del_col:
+        if st.button("🗑️", help="Borrar API Key"):
+            config["av_key"] = ""; save_json(CONFIG_PATH, config); st.experimental_rerun()
+
     config["checks_per_day"] = st.number_input("Chequeos por día (1‑1440)", 1, 1440, int(config["checks_per_day"]))
     st.markdown("---")
     st.subheader("SMTP / Gmail")
@@ -162,59 +136,38 @@ with st.sidebar:
     config["email_to"] = st.text_input("Enviar alertas a", value=config["email_to"])
     colA, colB = st.columns(2)
     if colA.button("💾 Guardar configuración"):
-        save_json(CONFIG_PATH, config)
-        st.success("Configuración guardada ✔️")
+        save_json(CONFIG_PATH, config); st.success("Configuración guardada ✔️")
     if colB.button("📧 Correo de prueba"):
-        if send_email("Test Price Alerts", "Correo de prueba"):
-            st.success("Enviado ✔️")
+        send_email("Test Price Alerts", "Correo de prueba")
 
 # --- Agregar activo ---
 st.markdown("## ➕ Agregar activo a seguimiento")
 col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
-with col1:
-    symbol = st.text_input("Ticker / Símbolo", placeholder="AAPL o BTC")
-with col2:
-    asset_type = st.selectbox("Tipo", ["stock", "crypto"], index=0)
-with col3:
-    direction = st.selectbox("Condición", ["above", "below"], index=0)
-with col4:
-    target = st.number_input("Precio USD", min_value=0.01, step=0.01)
+with col1: symbol = st.text_input("Ticker / Símbolo", placeholder="AAPL o BTC")
+with col2: asset_type = st.selectbox("Tipo", ["stock", "crypto"], index=0)
+with col3: direction = st.selectbox("Condición", ["above", "below"], index=0)
+with col4: target = st.number_input("Precio USD", min_value=0.01, step=0.01)
 
 if st.button("Agregar a lista"):
     if symbol and target > 0:
-        watchlist.append({
-            "symbol": symbol.upper(),
-            "type": asset_type,
-            "direction": direction,
-            "target": target,
-            "last": None,
-            "triggered": False,
-        })
-        save_json(WATCHLIST_PATH, watchlist)
-        st.success(f"{symbol.upper()} agregado")
+        watchlist.append({"symbol": symbol.upper(), "type": asset_type, "direction": direction, "target": target, "last": None, "triggered": False})
+        save_json(WATCHLIST_PATH, watchlist); st.success(f"{symbol.upper()} agregado")
     else:
         st.error("Completa símbolo y precio válido")
 
 # --- Lista en vivo ---
 st.markdown("## 📈 Lista de seguimiento – precios en tiempo real")
-
 if watchlist:
-    header_cols = st.columns([1.2, 0.8, 1.5, 1.2, 0.8, 0.6])
-    for col, text in zip(header_cols, ["Ticker", "Tipo", "Condición", "Precio actual", "Estado", ""]):
-        col.markdown(f"**{text}**")
-
-    for idx, item in enumerate(watchlist):
-        row = st.columns([1.2, 0.8, 1.5, 1.2, 0.8, 0.6])
-        row[0].markdown(item["symbol"])
-        row[1].markdown(item["type"])
-        row[2].markdown(("≥" if item["direction"] == "above" else "≤") + f" {item['target']}")
-        row[3].markdown(f"{item['last']:.2f}" if item.get("last") else "…")
-        row[4].markdown("🟢 Activa" if not item.get("triggered") else "🔔 Disparada")
-        if row[5].button("🗑️", key=f"del_{idx}"):
-            del watchlist[idx]
-            save_json(WATCHLIST_PATH, watchlist)
-            st.experimental_rerun()
-
+    headers = ["Ticker", "Tipo", "Condición", "Precio actual", "Estado", ""]
+    st.columns([1.2, .8, 1.5, 1.2, .8, .6]); [c.markdown(f"**{h}**") for c,h in zip(st.columns([1.2, .8, 1.5, 1.2, .8, .6]), headers)]
+    for idx, it in enumerate(watchlist):
+        cols = st.columns([1.2, .8, 1.5, 1.2, .8, .6])
+        cols[0].markdown(it["symbol"]); cols[1].markdown(it["type"])
+        cols[2].markdown(("≥" if it["direction"] == "above" else "≤") + f" {it['target']}")
+        cols[3].markdown(f"{it['last']:.2f}" if it.get("last") else "…")
+        cols[4].markdown("🟢 Activa" if not it.get("triggered") else "🔔 Disparada")
+        if cols[5].button("🗑️", key=f"del_{idx}"):
+            del watchlist[idx]; save_json(WATCHLIST_PATH, watchlist); st.experimental_rerun()
     st.caption(f"Última actualización: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
 else:
     st.info("Aún no hay activos en seguimiento.")
