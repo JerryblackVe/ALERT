@@ -57,6 +57,21 @@ st.markdown("""
         color: #f44336;
         font-weight: bold;
     }
+    .watchlist-item {
+        padding: 15px;
+        margin: 10px 0;
+        border-radius: 10px;
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+    }
+    .metric-card {
+        text-align: center;
+        padding: 20px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border-radius: 15px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -84,25 +99,10 @@ class PriceData:
     volume: Optional[float] = None
     market_cap: Optional[float] = None
 
-@dataclass
-class PriceHistory:
-    symbol: str
-    prices: deque
-    timestamps: deque
-    max_points: int = 100
-    
-    def add_point(self, price: float, timestamp: datetime):
-        self.prices.append(price)
-        self.timestamps.append(timestamp)
-        if len(self.prices) > self.max_points:
-            self.prices.popleft()
-            self.timestamps.popleft()
-
 # ———————————— RUTAS & DEFAULTS ————————————
 CONFIG_PATH = "config.json"
 WATCHLIST_PATH = "watchlist.json"
 CACHE_PATH = "price_cache.json"
-HISTORY_PATH = "price_history.json"
 
 DEFAULT_CONFIG: Dict = {
     "checks_per_day": 1440,
@@ -115,8 +115,7 @@ DEFAULT_CONFIG: Dict = {
     "max_retries": 3,
     "notification_cooldown": 300,
     "theme": "light",
-    "show_notifications": True,
-    "sound_alerts": False
+    "show_notifications": True
 }
 
 CRYPTO_SYMBOL_MAP = {
@@ -252,69 +251,12 @@ def validate_symbol(sym: str, atype: AssetType) -> Tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-# ———————————— HISTORIAL DE PRECIOS ————————————
-class PriceHistoryManager:
-    def __init__(self):
-        self.history: Dict[str, PriceHistory] = {}
-        self.load_history()
-    
-    def load_history(self):
-        raw = jload(HISTORY_PATH, {})
-        for symbol, data in raw.items():
-            self.history[symbol] = PriceHistory(
-                symbol=symbol,
-                prices=deque(data.get("prices", [])[-100:]),
-                timestamps=deque([datetime.fromisoformat(ts) for ts in data.get("timestamps", [])][-100:])
-            )
-    
-    def save_history(self):
-        data = {}
-        for symbol, hist in self.history.items():
-            data[symbol] = {
-                "prices": list(hist.prices),
-                "timestamps": [ts.isoformat() for ts in hist.timestamps]
-            }
-        jsave(HISTORY_PATH, data)
-    
-    def add_price(self, symbol: str, price: float, timestamp: datetime):
-        if symbol not in self.history:
-            self.history[symbol] = PriceHistory(symbol, deque(), deque())
-        self.history[symbol].add_point(price, timestamp)
-        self.save_history()
-    
-    def get_chart_data(self, symbol: str) -> Optional[go.Figure]:
-        if symbol not in self.history or len(self.history[symbol].prices) < 2:
-            return None
-        
-        hist = self.history[symbol]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=list(hist.timestamps),
-            y=list(hist.prices),
-            mode='lines+markers',
-            name=symbol,
-            line=dict(width=2),
-            marker=dict(size=4)
-        ))
-        
-        fig.update_layout(
-            title=f"Historial de {symbol}",
-            xaxis_title="Tiempo",
-            yaxis_title="Precio (USD)",
-            hovermode='x unified',
-            template="plotly_white",
-            height=300
-        )
-        
-        return fig
-
 # ———————————— NOTIFICADOR ————————————
 class Notifier:
     def __init__(self, cooldown: int, cfg: Dict):
         self.last: Dict[str, datetime] = {}
         self.cool = cooldown
         self.cfg = cfg
-        self.notification_queue = deque(maxlen=50)
 
     def _can(self, sym: str) -> bool:
         return sym not in self.last or (datetime.now() - self.last[sym]).total_seconds() > self.cool
@@ -344,17 +286,7 @@ class Notifier:
             logger.error(f"SMTP error: {e}")
             return False
 
-    def notify(self, sym: str, subj: str, body: str, alert_type: str = "price"):
-        notification = {
-            "symbol": sym,
-            "subject": subj,
-            "body": body,
-            "timestamp": datetime.now(),
-            "type": alert_type
-        }
-        
-        self.notification_queue.append(notification)
-        
+    def notify(self, sym: str, subj: str, body: str):
         if self._can(sym) and self.cfg.get("show_notifications", True):
             if self.email(subj, body):
                 self._mark(sym)
@@ -374,7 +306,6 @@ for env_var, key in (("SMTP_USER", "smtp_user"), ("SMTP_PASS", "smtp_pass"), ("E
 watchlist: List[Dict] = jload(WATCHLIST_PATH, [])
 cache = PriceCache(config["cache_duration_minutes"])
 notifier = Notifier(config["notification_cooldown"], config)
-history_manager = PriceHistoryManager()
 
 # ———————————— HILO DE ALERTAS ————————————
 def worker():
@@ -391,4 +322,52 @@ def worker():
                     "last_price": pd.price,
                     "change_24h": pd.change_24h,
                     "last_update": datetime.now().isoformat(),
+                    "error": None
+                })
                 
+                # Verificar alerta
+                hit = (pd.price >= item["target"]) if item["direction"] == "above" else (pd.price <= item["target"])
+                
+                if hit and not item.get("triggered"):
+                    op = "≥" if item["direction"] == "above" else "≤"
+                    subj = f"🚨 {item['symbol']} {op} ${item['target']}"
+                    body = f"""
+                    Alerta de Precio Activada!
+                    
+                    Símbolo: {item['symbol']}
+                    Precio actual: {format_price(pd.price)}
+                    Precio objetivo: ${item['target']}
+                    Cambio 24h: {pd.change_24h:.2f}% si pd.change_24h else 'N/A'
+                    
+                    Fecha: {datetime.now():%Y-%m-%d %H:%M:%S}
+                    """
+                    notifier.notify(item["symbol"], subj, body)
+                    item["triggered"] = True
+                    item["triggered_at"] = datetime.now().isoformat()
+                    item["triggered_price"] = pd.price
+                    
+            except Exception as e:
+                item["error"] = str(e)
+                logger.error(f"Error procesando {item.get('symbol', 'Unknown')}: {e}")
+                
+        jsave(WATCHLIST_PATH, watchlist)
+        time.sleep(interval)
+
+# Iniciar worker thread
+if "_worker_started" not in st.session_state:
+    threading.Thread(target=worker, daemon=True).start()
+    st.session_state["_worker_started"] = True
+
+# ———————————— STREAMLIT UI ————————————
+st.title("⏰ Price Alerts Pro – Acciones & Cripto")
+st.markdown("Sistema profesional de alertas de precio en tiempo real")
+
+# Auto-refresh
+st_autorefresh(interval=max(30000, 86400000 // config["checks_per_day"]), key="refresh")
+
+# ——— Métricas principales ———
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+    st.metric("📊 Activos", len(watchlist))
