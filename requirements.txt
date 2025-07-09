@@ -1,1 +1,3 @@
-<br>streamlit\nrequests\nstreamlit-autorefresh\n
+streamlit
+requests
+streamlit-autorefresh
