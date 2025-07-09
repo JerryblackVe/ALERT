@@ -1,13 +1,13 @@
 """
-Price Alert App – Alpha Vantage + CoinGecko (v2)
+Price Alert App – Alpha Vantage + CoinGecko (v3)
 ------------------------------------------------
-Ahora con **lista en vivo**: la tabla de seguimiento se refresca automáticamente a la frecuencia que elijas.
-* Alpha Vantage para acciones, CoinGecko para cripto.
-* Chequeos por día configurables (1‑1440) ➜ autorefresh del frontend.
-* Botón de correo de prueba para SMTP.
+Novedades:
+* **Botón 🗑️** para eliminar cualquier activo de la lista.
+* La lista sigue guardándose en `watchlist.json`; persiste mientras Streamlit Cloud no haga un rebuild manual.
+* Tabla interactiva reemplazada por filas con botones.
 
-Requisitos
-----------
+Instalación
+-----------
 ```bash
 pip install streamlit requests streamlit-autorefresh
 ```
@@ -35,7 +35,7 @@ import ssl
 CONFIG_PATH = "config.json"
 WATCHLIST_PATH = "watchlist.json"
 DEFAULT_CONFIG = {
-    "av_key": "",            # Alpha Vantage API key
+    "av_key": "",            # Alpha Vantage API key
     "checks_per_day": 1440,    # 1440 = cada 60 s
     "smtp_host": "smtp.gmail.com",
     "smtp_port": 465,
@@ -74,7 +74,7 @@ watchlist: List[Dict] = load_json(WATCHLIST_PATH, [])
 
 def get_stock_price(symbol: str) -> float:
     if not config["av_key"]:
-        raise ValueError("Falta Alpha Vantage API key en Configuración.")
+        raise ValueError("Falta Alpha Vantage API key en Configuración.")
     url = (
         "https://www.alphavantage.co/query"
         f"?function=GLOBAL_QUOTE&symbol={symbol.upper()}&apikey={config['av_key']}"
@@ -154,7 +154,6 @@ if "alerts_thread" not in st.session_state:
     st.session_state["alerts_thread"] = True
 
 # -------- UI (Streamlit) --------
-# Autorefresh interval based on checks_per_day
 refresh_ms = max(10, int(86400000 / config.get("checks_per_day", 1440)))
 st_autorefresh(interval=refresh_ms, key="datarefresh")
 
@@ -165,7 +164,7 @@ st.title("⏰ Price Alerts – Acciones & Cripto (en vivo)")
 # ---- Sidebar Config ----
 with st.sidebar:
     st.header("⚙️ Configuración")
-    config["av_key"] = st.text_input("Alpha Vantage API Key", value=config["av_key"], type="password")
+    config["av_key"] = st.text_input("Alpha Vantage API Key", value=config["av_key"], type="password")
     config["checks_per_day"] = st.number_input(
         "Chequeos por día (1‑1440)", min_value=1, max_value=1440, value=int(config["checks_per_day"]), step=1
     )
@@ -213,24 +212,29 @@ if st.button("Agregar a lista"):
     else:
         st.error("Completa símbolo y precio objetivo válido")
 
-# ---- Live watchlist ----
+# ---- Live watchlist with delete button ----
 st.markdown("## 📈 Lista de seguimiento – precios en tiempo real")
+
 if watchlist:
-    live_table = []
-    for item in watchlist:
-        live_table.append(
-            {
-                "Ticker": item["symbol"],
-                "Tipo": item["type"],
-                "Condición": ("≥" if item["direction"] == "above" else "≤") + f" {item['target']}",
-                "Precio actual": f"{item['last']:.2f}" if item.get("last") else "…",
-                "Estado": "🟢 Activa" if not item.get("triggered") else "🔔 Disparada",
-                "Error": item.get("error", ""),
-            }
-        )
-    st.dataframe(live_table, use_container_width=True)
+    header_cols = st.columns([1.2, 0.8, 1.5, 1.2, 0.8, 0.6])
+    headers = ["Ticker", "Tipo", "Condición", "Precio actual", "Estado", ""]
+    for col, text in zip(header_cols, headers):
+        col.markdown(f"**{text}**")
+
+    for idx, item in enumerate(watchlist):
+        row = st.columns([1.2, 0.8, 1.5, 1.2, 0.8, 0.6])
+                row[1].markdown(item["type"])
+        row[2].markdown(("≥" if item["direction"] == "above" else "≤") + f" {item['target']}")
+        price_display = f"{item['last']:.2f}" if item.get("last") else "…"
+        row[3].markdown(price_display)
+        row[4].markdown("🟢 Activa" if not item.get("triggered") else "🔔 Disparada")
+        if row[5].button("🗑️", key=f"del_{idx}"):
+            del watchlist[idx]
+            save_json(WATCHLIST_PATH, watchlist)
+            st.experimental_rerun()
+
     st.caption(f"Última actualización: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
 else:
     st.info("Aún no hay activos en seguimiento.")
 
-st.caption("App Streamlit © 2025 – Fantastic Plastik")
+st.caption("App Streamlit © 2025 – Fantastic Plastik")
