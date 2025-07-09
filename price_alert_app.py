@@ -1,9 +1,10 @@
 """
-Price Alert App – Alpha Vantage + CoinGecko (v3‑fix)
----------------------------------------------------
+Price Alert App – Alpha Vantage + CoinGecko (v3‑fix2)
+----------------------------------------------------
 • Botón 🗑️ para eliminar activos.
 • Lista persiste en `watchlist.json`.
 • Tabla en vivo con autorefresco.
+• Sintaxis corregida (f‑string cerrada).
 """
 
 import os
@@ -125,7 +126,11 @@ def check_alerts():
                 if cond and not item.get("triggered", False):
                     op = "≥" if item["direction"] == "above" else "≤"
                     subject = f"Alerta {item['symbol'].upper()} {op} {item['target']}"
-                    body = f"Ticker: {item['symbol'].upper()}\nPrecio actual: {price:.2f} USD\nHora: {datetime.utcnow()} UTC"
+                    body = (
+                        f"Ticker: {item['symbol'].upper()}\n"
+                        f"Precio actual: {price:.2f} USD\n"
+                        f"Hora: {datetime.utcnow()} UTC"
+                    )
                     send_email(subject, body)
                     item["triggered"] = True
             except Exception as e:
@@ -160,7 +165,7 @@ with st.sidebar:
         save_json(CONFIG_PATH, config)
         st.success("Configuración guardada ✔️")
     if colB.button("📧 Correo de prueba"):
-        if send_email("Test Price Alerts", "Correo de prueba" ):
+        if send_email("Test Price Alerts", "Correo de prueba"):
             st.success("Enviado ✔️")
 
 # --- Agregar activo ---
@@ -195,8 +200,7 @@ st.markdown("## 📈 Lista de seguimiento – precios en tiempo real")
 
 if watchlist:
     header_cols = st.columns([1.2, 0.8, 1.5, 1.2, 0.8, 0.6])
-    headers = ["Ticker", "Tipo", "Condición", "Precio actual", "Estado", ""]
-    for col, text in zip(header_cols, headers):
+    for col, text in zip(header_cols, ["Ticker", "Tipo", "Condición", "Precio actual", "Estado", ""]):
         col.markdown(f"**{text}**")
 
     for idx, item in enumerate(watchlist):
@@ -211,4 +215,8 @@ if watchlist:
             save_json(WATCHLIST_PATH, watchlist)
             st.experimental_rerun()
 
-    st.caption(f"Última actualización: {datetime.utcnow().strftime('%H:%M:%
+    st.caption(f"Última actualización: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
+else:
+    st.info("Aún no hay activos en seguimiento.")
+
+st.caption("App Streamlit © 2025 – Fantastic Plastik")
