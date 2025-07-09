@@ -1,20 +1,9 @@
 """
-Price Alert App – Alpha Vantage + CoinGecko (v3)
-------------------------------------------------
-Novedades:
-* **Botón 🗑️** para eliminar cualquier activo de la lista.
-* La lista sigue guardándose en `watchlist.json`; persiste mientras Streamlit Cloud no haga un rebuild manual.
-* Tabla interactiva reemplazada por filas con botones.
-
-Instalación
------------
-```bash
-pip install streamlit requests streamlit-autorefresh
-```
-Ejecución:
-```bash
-streamlit run price_alert_app.py
-```
+Price Alert App – Alpha Vantage + CoinGecko (v3‑fix)
+---------------------------------------------------
+• Botón 🗑️ para eliminar activos.
+• Lista persiste en `watchlist.json`.
+• Tabla en vivo con autorefresco.
 """
 
 import os
@@ -31,17 +20,17 @@ from email.message import EmailMessage
 import smtplib
 import ssl
 
-# -------- Paths & defaults --------
+# ---------- Constantes ----------
 CONFIG_PATH = "config.json"
 WATCHLIST_PATH = "watchlist.json"
 DEFAULT_CONFIG = {
-    "av_key": "",            # Alpha Vantage API key
-    "checks_per_day": 1440,    # 1440 = cada 60 s
+    "av_key": "",
+    "checks_per_day": 1440,
     "smtp_host": "smtp.gmail.com",
     "smtp_port": 465,
     "smtp_user": "",
     "smtp_pass": "",
-    "email_to": ""
+    "email_to": "",
 }
 
 CRYPTO_SYMBOL_MAP = {
@@ -51,7 +40,7 @@ CRYPTO_SYMBOL_MAP = {
     "sol": "solana",
 }
 
-# -------- Persistence helpers --------
+# ---------- Utilidades JSON ----------
 
 def load_json(path: str, default):
     if os.path.exists(path):
@@ -66,11 +55,11 @@ def save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-# -------- Load config & watchlist --------
+# ---------- Cargar config y watchlist ----------
 config: Dict = load_json(CONFIG_PATH, DEFAULT_CONFIG)
 watchlist: List[Dict] = load_json(WATCHLIST_PATH, [])
 
-# -------- Market price functions --------
+# ---------- Funciones de precio ----------
 
 def get_stock_price(symbol: str) -> float:
     if not config["av_key"]:
@@ -102,7 +91,7 @@ def get_crypto_price(symbol: str) -> float:
 def current_price(item: Dict) -> float:
     return get_stock_price(item["symbol"]) if item["type"] == "stock" else get_crypto_price(item["symbol"])
 
-# -------- Email helpers --------
+# ---------- Email ----------
 
 def send_email(subject: str, body: str):
     if not all([config["smtp_user"], config["smtp_pass"], config["email_to"]]):
@@ -123,37 +112,32 @@ def send_email(subject: str, body: str):
         st.error(f"Error enviando mail: {e}")
         return False
 
-# -------- Alert checking thread --------
+# ---------- Hilo de alertas ----------
 
 def check_alerts():
     while True:
-        refresh_seconds = max(10, int(86400 / config.get("checks_per_day", 1440)))
+        refresh_s = max(10, int(86400 / config.get("checks_per_day", 1440)))
         for item in watchlist:
             try:
                 price = current_price(item)
                 item["last"] = price
-                cond_met = price >= item["target"] if item["direction"] == "above" else price <= item["target"]
-                if cond_met and not item.get("triggered", False):
-                    cond_symbol = "≥" if item["direction"] == "above" else "≤"
-                    subject = f"Alerta {item['symbol'].upper()} {cond_symbol} {item['target']}"
-                    body = (
-                        f"Ticker: {item['symbol'].upper()}\n"
-                        f"Precio actual: {price:.2f} USD\n"
-                        f"Hora: {datetime.utcnow()} UTC"
-                    )
+                cond = price >= item["target"] if item["direction"] == "above" else price <= item["target"]
+                if cond and not item.get("triggered", False):
+                    op = "≥" if item["direction"] == "above" else "≤"
+                    subject = f"Alerta {item['symbol'].upper()} {op} {item['target']}"
+                    body = f"Ticker: {item['symbol'].upper()}\nPrecio actual: {price:.2f} USD\nHora: {datetime.utcnow()} UTC"
                     send_email(subject, body)
                     item["triggered"] = True
             except Exception as e:
                 item["error"] = str(e)
         save_json(WATCHLIST_PATH, watchlist)
-        time.sleep(refresh_seconds)
+        time.sleep(refresh_s)
 
-# Launch thread once
 if "alerts_thread" not in st.session_state:
     threading.Thread(target=check_alerts, daemon=True).start()
     st.session_state["alerts_thread"] = True
 
-# -------- UI (Streamlit) --------
+# ---------- UI ----------
 refresh_ms = max(10, int(86400000 / config.get("checks_per_day", 1440)))
 st_autorefresh(interval=refresh_ms, key="datarefresh")
 
@@ -161,29 +145,25 @@ st.set_page_config(page_title="⏰ Price Alerts", layout="wide", initial_sidebar
 
 st.title("⏰ Price Alerts – Acciones & Cripto (en vivo)")
 
-# ---- Sidebar Config ----
+# --- Sidebar ---
 with st.sidebar:
     st.header("⚙️ Configuración")
     config["av_key"] = st.text_input("Alpha Vantage API Key", value=config["av_key"], type="password")
-    config["checks_per_day"] = st.number_input(
-        "Chequeos por día (1‑1440)", min_value=1, max_value=1440, value=int(config["checks_per_day"]), step=1
-    )
+    config["checks_per_day"] = st.number_input("Chequeos por día (1‑1440)", 1, 1440, int(config["checks_per_day"]))
     st.markdown("---")
     st.subheader("SMTP / Gmail")
     config["smtp_user"] = st.text_input("Usuario Gmail", value=config["smtp_user"])
     config["smtp_pass"] = st.text_input("App Password Gmail", value=config["smtp_pass"], type="password")
     config["email_to"] = st.text_input("Enviar alertas a", value=config["email_to"])
     colA, colB = st.columns(2)
-    with colA:
-        if st.button("💾 Guardar configuración"):
-            save_json(CONFIG_PATH, config)
-            st.success("Configuración guardada ✔️")
-    with colB:
-        if st.button("📧 Correo de prueba"):
-            if send_email("Test Price Alerts", "Correo de prueba de Price Alerts."):
-                st.success("Enviado ✔️")
+    if colA.button("💾 Guardar configuración"):
+        save_json(CONFIG_PATH, config)
+        st.success("Configuración guardada ✔️")
+    if colB.button("📧 Correo de prueba"):
+        if send_email("Test Price Alerts", "Correo de prueba" ):
+            st.success("Enviado ✔️")
 
-# ---- Add asset ----
+# --- Agregar activo ---
 st.markdown("## ➕ Agregar activo a seguimiento")
 col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 with col1:
@@ -197,22 +177,20 @@ with col4:
 
 if st.button("Agregar a lista"):
     if symbol and target > 0:
-        watchlist.append(
-            {
-                "symbol": symbol.upper(),
-                "type": asset_type,
-                "direction": direction,
-                "target": target,
-                "last": None,
-                "triggered": False,
-            }
-        )
+        watchlist.append({
+            "symbol": symbol.upper(),
+            "type": asset_type,
+            "direction": direction,
+            "target": target,
+            "last": None,
+            "triggered": False,
+        })
         save_json(WATCHLIST_PATH, watchlist)
         st.success(f"{symbol.upper()} agregado")
     else:
-        st.error("Completa símbolo y precio objetivo válido")
+        st.error("Completa símbolo y precio válido")
 
-# ---- Live watchlist with delete button ----
+# --- Lista en vivo ---
 st.markdown("## 📈 Lista de seguimiento – precios en tiempo real")
 
 if watchlist:
@@ -223,18 +201,14 @@ if watchlist:
 
     for idx, item in enumerate(watchlist):
         row = st.columns([1.2, 0.8, 1.5, 1.2, 0.8, 0.6])
-                row[1].markdown(item["type"])
+        row[0].markdown(item["symbol"])
+        row[1].markdown(item["type"])
         row[2].markdown(("≥" if item["direction"] == "above" else "≤") + f" {item['target']}")
-        price_display = f"{item['last']:.2f}" if item.get("last") else "…"
-        row[3].markdown(price_display)
+        row[3].markdown(f"{item['last']:.2f}" if item.get("last") else "…")
         row[4].markdown("🟢 Activa" if not item.get("triggered") else "🔔 Disparada")
         if row[5].button("🗑️", key=f"del_{idx}"):
             del watchlist[idx]
             save_json(WATCHLIST_PATH, watchlist)
             st.experimental_rerun()
 
-    st.caption(f"Última actualización: {datetime.utcnow().strftime('%H:%M:%S')} UTC")
-else:
-    st.info("Aún no hay activos en seguimiento.")
-
-st.caption("App Streamlit © 2025 – Fantastic Plastik")
+    st.caption(f"Última actualización: {datetime.utcnow().strftime('%H:%M:%
