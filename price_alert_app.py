@@ -1,15 +1,67 @@
-import os, json, time, threading, ssl, smtplib
-from datetime import datetime
-from typing import Dict, List, Optional
-import requests
-import yfinance as yf
-import streamlit as st
+"""
+Price Alert App – Yahoo Finance + CoinGecko (Versión Mejorada)
+============================================================
+
+Mejoras implementadas:
+• Cache inteligente para reducir API calls
+• Manejo robusto de errores
+• UI más intuitiva con métricas
+• Validación mejorada de símbolos
+• Logging para debugging
+• Filtros y búsqueda en watchlist
+• Notificaciones múltiples
+• Gestión mejorada de estado
+• Configuración de intervalos personalizados
+• Soporte para múltiples tipos de alertas
+
+Instalación:
+```bash
+pip install yfinance requests streamlit streamlit-autorefresh
+```
+"""
+
+import os, json, time, threading, ssl, smtplib, logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
+
+import requests, yfinance as yf, streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from email.message import EmailMessage
 
-# ---------- Rutas y defaults ----------
+# ---------- Configuración de logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('price_alerts.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Enums y clases ----------
+class AlertDirection(Enum):
+    ABOVE = "above"
+    BELOW = "below"
+    PERCENTAGE_CHANGE = "percentage_change"
+
+class AssetType(Enum):
+    STOCK = "stock"
+    CRYPTO = "crypto"
+
+@dataclass
+class PriceData:
+    price: float
+    timestamp: datetime
+    change_24h: Optional[float] = None
+    volume: Optional[float] = None
+
+# ---------- Rutas y configuración ----------
 CONFIG_PATH = "config.json"
 WATCHLIST_PATH = "watchlist.json"
+CACHE_PATH = "price_cache.json"
 
 DEFAULT_CONFIG = {
     "checks_per_day": 1440,
@@ -18,391 +70,558 @@ DEFAULT_CONFIG = {
     "smtp_user": "",
     "smtp_pass": "",
     "email_to": "",
+    "cache_duration_minutes": 2,
+    "max_retries": 3,
+    "retry_delay": 5,
+    "enable_logging": True,
+    "notification_cooldown": 300,  # 5 minutos entre notificaciones del mismo activo
 }
 
-# Usar un enfoque más flexible para criptomonedas si es posible,
-# pero para símbolos comunes, un mapa sigue siendo útil.
-# Idealmente, deberíamos buscar el ID de CoinGecko por símbolo si no está en el mapa.
 CRYPTO_SYMBOL_MAP = {
-    "btc": "bitcoin",
-    "eth": "ethereum",
-    "ada": "cardano",
-    "sol": "solana",
-    "xrp": "ripple", # Añadir algunos más comunes
-    "doge": "dogecoin",
+    "btc": "bitcoin", "eth": "ethereum", "ada": "cardano", "sol": "solana",
+    "doge": "dogecoin", "matic": "polygon", "link": "chainlink", "dot": "polkadot",
+    "xrp": "ripple", "ltc": "litecoin", "bch": "bitcoin-cash", "xlm": "stellar"
 }
 
 # ---------- Utilidades JSON ----------
-
-def load_json(path: str, default: Dict | List):
-    """Carga datos JSON desde un archivo, con manejo de errores."""
+def load_json(path: str, default):
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except json.JSONDecodeError:
-            st.error(f"Error: El archivo {path} está corrupto o mal formado. Usando valores por defecto.")
-            return default.copy()
         except Exception as e:
-            st.error(f"Error al cargar {path}: {e}. Usando valores por defecto.")
-            return default.copy()
-    return default.copy()
+            logger.error(f"Error loading {path}: {e}")
+    return default.copy() if hasattr(default, 'copy') else default
 
-def save_json(path: str, data: Dict | List):
-    """Guarda datos JSON en un archivo."""
+def save_json(path: str, data):
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, indent=2, default=str)
     except Exception as e:
-        st.error(f"Error al guardar {path}: {e}")
+        logger.error(f"Error saving {path}: {e}")
 
-# ---------- Cargar configuración y lista (Usando caché de Streamlit) ----------
-# Utilizar st.session_state para la configuración y la watchlist
-# asegura que se persistan a través de los refrescos de Streamlit.
-if "config" not in st.session_state:
-    st.session_state.config = load_json(CONFIG_PATH, DEFAULT_CONFIG)
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_json(WATCHLIST_PATH, [])
+# ---------- Cache de precios ----------
+class PriceCache:
+    def __init__(self, cache_duration_minutes: int = 2):
+        self.cache_duration = timedelta(minutes=cache_duration_minutes)
+        self.cache = load_json(CACHE_PATH, {})
+        self._convert_timestamps()
+    
+    def _convert_timestamps(self):
+        """Convierte timestamps string a datetime"""
+        for key, value in self.cache.items():
+            if isinstance(value.get('timestamp'), str):
+                try:
+                    value['timestamp'] = datetime.fromisoformat(value['timestamp'])
+                except:
+                    del self.cache[key]
+    
+    def get(self, key: str) -> Optional[PriceData]:
+        if key in self.cache:
+            data = self.cache[key]
+            timestamp = data.get('timestamp')
+            if isinstance(timestamp, datetime) and datetime.now() - timestamp < self.cache_duration:
+                return PriceData(
+                    price=data['price'],
+                    timestamp=timestamp,
+                    change_24h=data.get('change_24h'),
+                    volume=data.get('volume')
+                )
+        return None
+    
+    def set(self, key: str, price_data: PriceData):
+        self.cache[key] = {
+            'price': price_data.price,
+            'timestamp': price_data.timestamp,
+            'change_24h': price_data.change_24h,
+            'volume': price_data.volume
+        }
+        save_json(CACHE_PATH, self.cache)
 
-config: Dict = st.session_state.config
-watchlist: List[Dict] = st.session_state.watchlist
+# ---------- Funciones de precio mejoradas ----------
+def get_stock_price(symbol: str, cache: PriceCache, max_retries: int = 3) -> PriceData:
+    """Obtiene precio de acciones con retry y cache"""
+    cache_key = f"stock_{symbol.upper()}"
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        return cached_data
+    
+    for attempt in range(max_retries):
+        try:
+            ticker = yf.Ticker(symbol.upper())
+            info = ticker.info
+            
+            # Intentar obtener precio actual
+            current_price = None
+            if hasattr(ticker, 'fast_info') and 'lastPrice' in ticker.fast_info:
+                current_price = float(ticker.fast_info['lastPrice'])
+            elif 'regularMarketPrice' in info:
+                current_price = float(info['regularMarketPrice'])
+            elif 'currentPrice' in info:
+                current_price = float(info['currentPrice'])
+            
+            if current_price is None:
+                raise ValueError("No se pudo obtener precio actual")
+            
+            # Datos adicionales
+            change_24h = info.get('regularMarketChangePercent')
+            volume = info.get('regularMarketVolume')
+            
+            price_data = PriceData(
+                price=current_price,
+                timestamp=datetime.now(),
+                change_24h=change_24h,
+                volume=volume
+            )
+            
+            cache.set(cache_key, price_data)
+            return price_data
+            
+        except Exception as e:
+            logger.warning(f"Intento {attempt + 1} fallido para {symbol}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Backoff exponencial
+            else:
+                raise ValueError(f"No se pudo obtener precio para {symbol} después de {max_retries} intentos: {e}")
 
-# ---------- Funciones de precio (con caché y mejor manejo de errores) ----------
+def get_crypto_price(symbol: str, cache: PriceCache, max_retries: int = 3) -> PriceData:
+    """Obtiene precio de criptomonedas con retry y cache"""
+    cache_key = f"crypto_{symbol.lower()}"
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        return cached_data
+    
+    coin_id = CRYPTO_SYMBOL_MAP.get(symbol.lower(), symbol.lower())
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(
+                f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd&include_24hr_change=true",
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if coin_id not in data:
+                raise ValueError(f"Criptomoneda {symbol} no encontrada")
+            
+            coin_data = data[coin_id]
+            price_data = PriceData(
+                price=float(coin_data['usd']),
+                timestamp=datetime.now(),
+                change_24h=coin_data.get('usd_24h_change')
+            )
+            
+            cache.set(cache_key, price_data)
+            return price_data
+            
+        except Exception as e:
+            logger.warning(f"Intento {attempt + 1} fallido para {symbol}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                raise ValueError(f"No se pudo obtener precio para {symbol} después de {max_retries} intentos: {e}")
 
-# Caché simple para evitar llamadas repetitivas en un corto período
-_price_cache = {}
-_cache_expiry_time = 60 # segundos para la caché de precios
-
-def get_stock_price(symbol: str) -> Optional[float]:
-    """Obtiene el precio de una acción usando yfinance."""
-    current_time = time.time()
-    if symbol in _price_cache and current_time - _price_cache[symbol]["timestamp"] < _cache_expiry_time:
-        return _price_cache[symbol]["price"]
-
+def validate_symbol(symbol: str, asset_type: AssetType) -> bool:
+    """Valida si un símbolo existe"""
     try:
-        ticker = yf.Ticker(symbol.upper())
-        # Priorizar 'currentPrice' o 'regularMarketPrice' que son más comunes para precios en vivo
-        price = None
-        if "currentPrice" in ticker.info:
-            price = float(ticker.info["currentPrice"])
-        elif "regularMarketPrice" in ticker.info:
-            price = float(ticker.info["regularMarketPrice"])
-        elif "lastPrice" in ticker.fast_info: # fast_info es a veces más rápido pero menos completo
-             price = float(ticker.fast_info["lastPrice"])
-
-        if price is not None:
-            _price_cache[symbol] = {"price": price, "timestamp": current_time}
-            return price
+        cache = PriceCache(cache_duration_minutes=0)  # No usar cache para validación
+        if asset_type == AssetType.STOCK:
+            get_stock_price(symbol, cache)
         else:
-            st.warning(f"No se encontró un precio válido para {symbol} en los datos disponibles.")
-            return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error de red al obtener precio para {symbol}: {e}")
-        return None
-    except Exception as e:
-        st.error(f"Error al obtener precio para {symbol}: {e}")
-        return None
+            get_crypto_price(symbol, cache)
+        return True
+    except:
+        return False
 
-def get_crypto_price(symbol: str) -> Optional[float]:
-    """Obtiene el precio de una criptomoneda usando CoinGecko."""
-    current_time = time.time()
-    if symbol in _price_cache and current_time - _price_cache[symbol]["timestamp"] < _cache_expiry_time:
-        return _price_cache[symbol]["price"]
+# ---------- Sistema de notificaciones mejorado ----------
+class NotificationManager:
+    def __init__(self):
+        self.last_notification = {}
+        self.cooldown_period = config.get("notification_cooldown", 300)
+    
+    def should_notify(self, symbol: str) -> bool:
+        """Verifica si puede enviar notificación (cooldown)"""
+        last_time = self.last_notification.get(symbol)
+        if last_time is None:
+            return True
+        return (datetime.now() - last_time).total_seconds() > self.cooldown_period
+    
+    def mark_notification_sent(self, symbol: str):
+        """Marca que se envió una notificación"""
+        self.last_notification[symbol] = datetime.now()
 
-    cid = CRYPTO_SYMBOL_MAP.get(symbol.lower(), symbol.lower())
-    try:
-        # Añadir un manejo para símbolos no encontrados en CoinGecko
-        response = requests.get(
-            f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd", timeout=10
-        )
-        response.raise_for_status() # Lanza un error para códigos de estado HTTP erróneos
-        data = response.json()
-        
-        if cid in data and "usd" in data[cid]:
-            price = float(data[cid]["usd"])
-            _price_cache[symbol] = {"price": price, "timestamp": current_time}
-            return price
-        else:
-            st.warning(f"No se encontró precio para la criptomoneda '{symbol}' (ID: '{cid}'). Asegúrate de que el símbolo sea correcto.")
-            return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error de red al obtener precio para {symbol}: {e}")
-        return None
-    except (json.JSONDecodeError, KeyError) as e:
-        st.error(f"Error procesando datos de CoinGecko para {symbol}: {e}")
-        return None
-    except Exception as e:
-        st.error(f"Error al obtener precio de cripto para {symbol}: {e}")
-        return None
-
-def current_price(item: Dict) -> Optional[float]:
-    """Función unificada para obtener el precio actual de un activo."""
-    if item["type"] == "stock":
-        return get_stock_price(item["symbol"])
-    else:
-        return get_crypto_price(item["symbol"])
-
-# ---------- Email ----------
+notification_manager = NotificationManager()
 
 def send_email(subject: str, body: str) -> bool:
-    """Envía un correo electrónico de alerta."""
-    if not all([config["smtp_user"], config["smtp_pass"], config["email_to"]]):
-        st.error("⚠️ Configura los campos SMTP en la barra lateral para enviar correos.")
+    """Envía email con manejo de errores mejorado"""
+    required_fields = ["smtp_user", "smtp_pass", "email_to"]
+    if not all(config.get(field) for field in required_fields):
+        logger.error("Configuración SMTP incompleta")
         return False
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = config["smtp_user"]
-    msg["To"] = config["email_to"]
-    msg.set_content(body)
+    
     try:
-        with smtplib.SMTP_SSL(config["smtp_host"], config["smtp_port"], context=ssl.create_default_context()) as s:
-            s.login(config["smtp_user"], config["smtp_pass"])
-            s.send_message(msg)
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = config["smtp_user"]
+        msg["To"] = config["email_to"]
+        msg.set_content(body)
+        
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(config["smtp_host"], config["smtp_port"], context=context) as server:
+            server.login(config["smtp_user"], config["smtp_pass"])
+            server.send_message(msg)
+        
+        logger.info(f"Email enviado: {subject}")
         return True
-    except smtplib.SMTPAuthenticationError:
-        st.error("Error de autenticación SMTP. Revisa tu usuario y 'App Password' de Gmail.")
-        return False
-    except smtplib.SMTPServerDisconnected:
-        st.error("Error: El servidor SMTP se desconectó inesperadamente. Intenta de nuevo más tarde.")
-        return False
+        
     except Exception as e:
-        st.error(f"Error enviando mail: {e}")
+        logger.error(f"Error enviando email: {e}")
         return False
 
-# ---------- Hilo de alertas (gestionado por Streamlit con st.session_state) ----------
-# Es crucial que el hilo de alertas no interactúe directamente con los elementos de UI de Streamlit
-# ya que estos solo pueden ser modificados por el hilo principal de Streamlit.
-# Usaremos st.session_state para compartir el estado.
-
-def check_alerts_loop():
-    """Bucle que verifica las alertas en segundo plano."""
+# ---------- Hilo de alertas mejorado ----------
+def check_alerts():
+    """Hilo principal para verificar alertas"""
+    cache = PriceCache(config.get("cache_duration_minutes", 2))
+    
     while True:
-        # Asegurarse de que los valores de configuración se lean del estado de la sesión
-        current_checks_per_day = st.session_state.config.get("checks_per_day", 1440)
-        interval = max(10, int(86400 / current_checks_per_day)) # Mínimo 10 segundos
-
-        # Copia de la watchlist para evitar problemas de concurrencia al modificarla en el UI
-        # y al mismo tiempo iterarla en el hilo.
-        watchlist_copy = list(st.session_state.watchlist)
-
-        updated_watchlist = []
-        for it in watchlist_copy:
-            item_modified = it.copy() # Copia para evitar modificar el original mientras se itera
-            try:
-                price = current_price(item_modified)
-                if price is not None:
-                    item_modified["last"] = price
-                    cond = price >= item_modified["target"] if item_modified["direction"] == "above" else price <= item_modified["target"]
-                    if cond and not item_modified.get("triggered", False):
-                        op = "≥" if item_modified["direction"] == "above" else "≤"
-                        body = (
-                            f"Ticker: {item_modified['symbol']}\n"
-                            f"Precio actual: {price:.2f} USD\n"
-                            f"Hora: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                        )
-                        # Intenta enviar el email. Si falla, el estado de triggered no cambia.
-                        if send_email(f"Alerta {item_modified['symbol']} {op} {item_modified['target']}", body):
-                            item_modified["triggered"] = True
-                            item_modified["last_triggered_time"] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-                            st.info(f"🔔 ¡Alerta disparada para {item_modified['symbol']}!") # Mostrar info en el UI
-                        else:
-                            st.warning(f"No se pudo enviar la alerta para {item_modified['symbol']}.")
-                item_modified["error"] = None # Limpiar errores previos si la obtención de precio fue exitosa
-            except Exception as e:
-                item_modified["error"] = str(e)
-            finally:
-                updated_watchlist.append(item_modified)
-
-        # Actualizar la watchlist en st.session_state y guardarla
-        st.session_state.watchlist = updated_watchlist
-        save_json(WATCHLIST_PATH, st.session_state.watchlist)
+        try:
+            interval = max(10, int(86400 / config.get("checks_per_day", 1440)))
+            
+            for item in watchlist:
+                try:
+                    # Obtener precio actual
+                    if item["type"] == AssetType.STOCK.value:
+                        price_data = get_stock_price(item["symbol"], cache, config.get("max_retries", 3))
+                    else:
+                        price_data = get_crypto_price(item["symbol"], cache, config.get("max_retries", 3))
+                    
+                    item["last_price"] = price_data.price
+                    item["last_update"] = datetime.now().isoformat()
+                    item["change_24h"] = price_data.change_24h
+                    item.pop("error", None)  # Limpiar errores previos
+                    
+                    # Verificar condición de alerta
+                    should_alert = False
+                    alert_msg = ""
+                    
+                    if item["direction"] == AlertDirection.ABOVE.value:
+                        should_alert = price_data.price >= item["target"]
+                        alert_msg = f"≥ {item['target']:.2f}"
+                    elif item["direction"] == AlertDirection.BELOW.value:
+                        should_alert = price_data.price <= item["target"]
+                        alert_msg = f"≤ {item['target']:.2f}"
+                    
+                    # Enviar alerta si es necesario
+                    if (should_alert and 
+                        not item.get("triggered", False) and 
+                        notification_manager.should_notify(item["symbol"])):
+                        
+                        change_text = f" (Cambio 24h: {price_data.change_24h:.2f}%)" if price_data.change_24h else ""
+                        body = f"""
+Alerta activada para {item['symbol']} ({item['type']})
+Condición: {alert_msg}
+Precio actual: ${price_data.price:.2f}{change_text}
+Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                        """.strip()
+                        
+                        if send_email(f"🚨 Alerta {item['symbol']} {alert_msg}", body):
+                            item["triggered"] = True
+                            item["triggered_at"] = datetime.now().isoformat()
+                            notification_manager.mark_notification_sent(item["symbol"])
+                
+                except Exception as e:
+                    logger.error(f"Error procesando {item.get('symbol', 'unknown')}: {e}")
+                    item["error"] = str(e)
+                    item["last_update"] = datetime.now().isoformat()
+            
+            # Guardar cambios
+            save_json(WATCHLIST_PATH, watchlist)
+            
+        except Exception as e:
+            logger.error(f"Error en check_alerts: {e}")
         
         time.sleep(interval)
 
-# Asegurar que el hilo solo se inicie una vez
-if "_alert_thread" not in st.session_state:
-    st.session_state._alert_thread = True
-    threading.Thread(target=check_alerts_loop, daemon=True).start()
+# ---------- Cargar configuración ----------
+config: Dict = load_json(CONFIG_PATH, DEFAULT_CONFIG)
+watchlist: List[Dict] = load_json(WATCHLIST_PATH, [])
 
-# ---------- UI ----------
-# La frecuencia de refresco de Streamlit debería ser independiente de la frecuencia de chequeo de alertas,
-# pero puede usarse para actualizar la vista.
-refresh_ms = max(5000, int(86400000 / config.get("checks_per_day", 1440))) # Mínimo 5 segundos de refresco de UI
+# ---------- Inicializar hilo de alertas ----------
+if "_alert_thread" not in st.session_state:
+    alert_thread = threading.Thread(target=check_alerts, daemon=True)
+    alert_thread.start()
+    st.session_state["_alert_thread"] = True
+
+# ---------- UI Principal ----------
+# Configuración de página
+st.set_page_config(
+    page_title="⏰ Price Alerts Pro",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Auto-refresh
+refresh_ms = max(30000, int(86400000 / config.get("checks_per_day", 1440)))
 st_autorefresh(interval=refresh_ms, key="datarefresh")
 
-st.set_page_config(page_title="⏰ Price Alerts", layout="wide", initial_sidebar_state="expanded")
-st.title("⏰ Price Alerts – Acciones & Cripto (Yahoo Finance)")
+# Título y métricas
+st.title("⏰ Price Alerts Pro – Acciones & Cripto")
 
-# --- Sidebar ---
+# Métricas principales
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Total Activos", len(watchlist))
+with col2:
+    active_alerts = len([item for item in watchlist if not item.get("triggered", False)])
+    st.metric("Alertas Activas", active_alerts)
+with col3:
+    triggered_alerts = len([item for item in watchlist if item.get("triggered", False)])
+    st.metric("Alertas Disparadas", triggered_alerts)
+with col4:
+    error_count = len([item for item in watchlist if item.get("error")])
+    st.metric("Errores", error_count)
+
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    # Usar un campo key para que Streamlit sepa cuándo el widget ha cambiado
-    # y no lo re-renderice innecesariamente, lo que podría borrar inputs.
-    new_checks_per_day = st.number_input(
-        "Chequeos por día (1‑1440)",
-        1,
-        1440,
-        int(config["checks_per_day"]),
-        key="checks_per_day_input"
+    # Configuración de alertas
+    st.subheader("Alertas")
+    config["checks_per_day"] = st.number_input(
+        "Chequeos por día", 
+        min_value=1, 
+        max_value=1440, 
+        value=int(config["checks_per_day"])
     )
-    if new_checks_per_day != config["checks_per_day"]:
-        config["checks_per_day"] = new_checks_per_day
-        
+    
+    config["cache_duration_minutes"] = st.number_input(
+        "Cache (minutos)", 
+        min_value=1, 
+        max_value=60, 
+        value=int(config["cache_duration_minutes"])
+    )
+    
+    config["notification_cooldown"] = st.number_input(
+        "Cooldown notificaciones (seg)", 
+        min_value=60, 
+        max_value=3600, 
+        value=int(config["notification_cooldown"])
+    )
+    
     st.markdown("---")
-    st.subheader("SMTP / Gmail")
     
-    new_smtp_user = st.text_input("Usuario Gmail", value=config["smtp_user"], key="smtp_user_input")
-    if new_smtp_user != config["smtp_user"]:
-        config["smtp_user"] = new_smtp_user
-
-    new_smtp_pass = st.text_input("App Password Gmail", value=config["smtp_pass"], type="password", key="smtp_pass_input")
-    if new_smtp_pass != config["smtp_pass"]:
-        config["smtp_pass"] = new_smtp_pass
-
-    new_email_to = st.text_input("Enviar alertas a", value=config["email_to"], key="email_to_input")
-    if new_email_to != config["email_to"]:
-        config["email_to"] = new_email_to
-
-    colA, colB = st.columns(2)
-    if colA.button("💾 Guardar configuración", key="save_config_btn"):
-        save_json(CONFIG_PATH, config)
-        st.session_state.config = config # Actualizar el estado de la sesión
-        st.success("Configuración guardada ✔️")
+    # Configuración SMTP
+    st.subheader("📧 Configuración Email")
+    config["smtp_host"] = st.text_input("Host SMTP", value=config["smtp_host"])
+    config["smtp_port"] = st.number_input("Puerto SMTP", value=int(config["smtp_port"]))
+    config["smtp_user"] = st.text_input("Usuario", value=config["smtp_user"])
+    config["smtp_pass"] = st.text_input("Contraseña", value=config["smtp_pass"], type="password")
+    config["email_to"] = st.text_input("Destinatario", value=config["email_to"])
     
-    if colB.button("📧 Correo de prueba", key="test_email_btn"):
-        if send_email("Test Price Alerts", "Correo de prueba desde tu app Price Alerts."):
-            st.success("Correo de prueba enviado correctamente ✔️")
-        else:
-            st.error("Fallo al enviar el correo de prueba. Revisa la consola para más detalles.")
+    # Botones de acción
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💾 Guardar"):
+            save_json(CONFIG_PATH, config)
+            st.success("✅ Guardado")
+    
+    with col2:
+        if st.button("📧 Test Email"):
+            if send_email("Test Price Alerts Pro", "Email de prueba funcionando correctamente."):
+                st.success("✅ Email enviado")
+            else:
+                st.error("❌ Error enviando email")
 
+# ---------- Agregar nuevo activo ----------
+st.markdown("## ➕ Agregar Nuevo Activo")
 
-# --- Agregar activo ---
-st.markdown("## ➕ Agregar activo a seguimiento")
-col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
-with col1: symbol = st.text_input("Ticker / Símbolo", placeholder="AAPL o BTC", key="symbol_input")
-with col2: asset_type = st.selectbox("Tipo", ["stock", "crypto"], index=0, key="asset_type_select")
-with col3: direction = st.selectbox("Condición", ["above", "below"], index=0, key="direction_select")
-with col4: target = st.number_input("Precio USD", min_value=0.01, step=0.01, format="%.2f", key="target_price_input")
+with st.form("add_asset_form"):
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+    
+    with col1:
+        symbol = st.text_input("Símbolo", placeholder="Ej: AAPL, BTC, ETH")
+    
+    with col2:
+        asset_type = st.selectbox("Tipo", [AssetType.STOCK.value, AssetType.CRYPTO.value])
+    
+    with col3:
+        direction = st.selectbox("Condición", [AlertDirection.ABOVE.value, AlertDirection.BELOW.value])
+    
+    with col4:
+        target = st.number_input("Precio USD", min_value=0.01, step=0.01)
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        submit = st.form_submit_button("Agregar")
+    
+    with col2:
+        validate_button = st.form_submit_button("Validar Símbolo")
 
-if st.button("Agregar a lista", key="add_to_list_btn"):
-    if symbol and target > 0:
-        # Normalizar el símbolo para cripto para evitar duplicados si se ingresa con mayúsculas/minúsculas diferentes
-        processed_symbol = symbol.upper() if asset_type == "stock" else symbol.lower()
-        
-        # Verificar si el activo ya está en la lista para evitar duplicados
-        exists = any(
-            item["symbol"].lower() == processed_symbol.lower() and item["type"] == asset_type
-            for item in watchlist
-        )
-        if exists:
-            st.warning(f"{symbol.upper() if asset_type == 'stock' else symbol.lower()} ya está en la lista de seguimiento.")
-        else:
+# Procesamiento del formulario
+if submit and symbol and target > 0:
+    # Validar símbolo
+    with st.spinner("Validando símbolo..."):
+        if validate_symbol(symbol, AssetType(asset_type)):
             new_item = {
-                "symbol": processed_symbol,
+                "symbol": symbol.upper(),
                 "type": asset_type,
                 "direction": direction,
                 "target": target,
-                "last": None,
+                "last_price": None,
                 "triggered": False,
-                "error": None, # Inicializar sin errores
-                "last_checked": None, # Para mostrar cuándo se verificó por última vez
-                "last_triggered_time": None # Para registrar cuándo se disparó la última alerta
+                "added_at": datetime.now().isoformat(),
+                "last_update": None
             }
             watchlist.append(new_item)
             save_json(WATCHLIST_PATH, watchlist)
-            st.success(f"**{symbol.upper() if asset_type == 'stock' else symbol.lower()}** agregado a la lista ✔️")
-            
-            # Limpiar los campos de entrada después de agregar
-            st.session_state.symbol_input = ""
-            st.session_state.target_price_input = 0.01
-    else:
-        st.error("Por favor, completa el símbolo y un precio objetivo válido.")
-
-# --- Lista en vivo ---
-st.markdown("## 📈 Lista de seguimiento – precios en tiempo real")
-if watchlist:
-    # Columnas con proporción más balanceada y una columna para acciones de usuario
-    headers = ["Ticker", "Tipo", "Condición", "Precio Actual", "Última Verificación", "Estado", ""]
-    header_cols = st.columns([1, 0.7, 1.2, 1, 1.5, 1, 0.5])
-    for col, h in zip(header_cols, headers):
-        col.markdown(f"**{h}**")
-
-    # Usar un bucle enumerate para acceder al índice y al elemento
-    # y permitir la eliminación segura
-    items_to_keep = []
-    for idx, item in enumerate(watchlist):
-        cols = st.columns([1, 0.7, 1.2, 1, 1.5, 1, 0.5])
-        
-        # Mostrar el símbolo correctamente (mayúsculas para acciones, minúsculas para cripto)
-        display_symbol = item["symbol"].upper() if item["type"] == "stock" else item["symbol"].lower()
-        cols[0].markdown(f"**{display_symbol}**")
-        cols[1].markdown(item["type"].capitalize()) # Capitalizar "stock" o "crypto"
-        
-        op = "≥" if item["direction"] == "above" else "≤"
-        cols[2].markdown(f"{op} {item['target']:.2f} USD")
-        
-        # Formatear el precio actual si está disponible, o mostrar "..."
-        current_price_display = f"{item['last']:.2f} USD" if item.get("last") is not None else "..."
-        cols[3].markdown(current_price_display)
-        
-        # Mostrar la última verificación
-        last_checked_time = datetime.utcnow().strftime('%H:%M:%S') # Esto se actualiza con el autorefresh de Streamlit
-        cols[4].markdown(last_checked_time + " UTC") # Esto es solo la última vez que la UI se refrescó
-
-        # Estado de la alerta
-        status_text = ""
-        status_color = ""
-        if item.get("error"):
-            status_text = f"❗ Error: {item['error']}"
-            status_color = "red"
-        elif item.get("triggered"):
-            status_text = f"🔔 Disparada ({item.get('last_triggered_time', 'N/A')} UTC)"
-            status_color = "orange" # Usar naranja para disparadas, pero activas
+            st.success(f"✅ {symbol.upper()} agregado correctamente")
+            st.rerun()
         else:
-            status_text = "🟢 Activa"
-            status_color = "green"
+            st.error(f"❌ Símbolo {symbol} no válido o no encontrado")
+
+elif validate_button and symbol:
+    with st.spinner("Validando símbolo..."):
+        if validate_symbol(symbol, AssetType(asset_type)):
+            st.success(f"✅ {symbol.upper()} es válido")
+        else:
+            st.error(f"❌ {symbol.upper()} no válido")
+
+# ---------- Filtros y búsqueda ----------
+st.markdown("## 📊 Lista de Seguimiento")
+
+if watchlist:
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        search = st.text_input("🔍 Buscar símbolo", placeholder="Filtrar por símbolo...")
+    
+    with col2:
+        type_filter = st.selectbox("Filtrar por tipo", ["Todos", AssetType.STOCK.value, AssetType.CRYPTO.value])
+    
+    with col3:
+        status_filter = st.selectbox("Filtrar por estado", ["Todos", "Activas", "Disparadas", "Con errores"])
+    
+    # Aplicar filtros
+    filtered_watchlist = watchlist.copy()
+    
+    if search:
+        filtered_watchlist = [item for item in filtered_watchlist if search.upper() in item["symbol"].upper()]
+    
+    if type_filter != "Todos":
+        filtered_watchlist = [item for item in filtered_watchlist if item["type"] == type_filter]
+    
+    if status_filter == "Activas":
+        filtered_watchlist = [item for item in filtered_watchlist if not item.get("triggered", False) and not item.get("error")]
+    elif status_filter == "Disparadas":
+        filtered_watchlist = [item for item in filtered_watchlist if item.get("triggered", False)]
+    elif status_filter == "Con errores":
+        filtered_watchlist = [item for item in filtered_watchlist if item.get("error")]
+    
+    # Mostrar tabla
+    if filtered_watchlist:
+        # Headers
+        headers = ["Símbolo", "Tipo", "Condición", "Precio", "Cambio 24h", "Estado", "Última Act.", "Acciones"]
+        cols = st.columns([1, 0.8, 1.2, 1, 1, 1, 1.2, 1])
         
-        cols[5].markdown(f"<span style='color:{status_color}'>{status_text}</span>", unsafe_allow_html=True)
-
-        # Botón para eliminar el activo de la lista
-        if cols[6].button("🗑️", key=f"del_{idx}"):
-            # En Streamlit, la forma más sencilla de manejar la eliminación es
-            # reconstruir la lista con los elementos que quieres mantener.
-            pass # No eliminar aquí, lo haremos al final del bucle
-
-        items_to_keep.append(item) # Añadir a la lista de elementos a mantener
-
-    # Procesar eliminaciones después de iterar para evitar problemas de índice
-    # Esta es una forma más robusta de manejar la eliminación en Streamlit.
-    # El bucle anterior solo marca qué botón se presionó, no elimina directamente.
+        for col, header in zip(cols, headers):
+            col.markdown(f"**{header}**")
+        
+        # Datos
+        for idx, item in enumerate(filtered_watchlist):
+            cols = st.columns([1, 0.8, 1.2, 1, 1, 1, 1.2, 1])
+            
+            # Símbolo
+            cols[0].markdown(f"**{item['symbol']}**")
+            
+            # Tipo
+            type_emoji = "📈" if item["type"] == AssetType.STOCK.value else "₿"
+            cols[1].markdown(f"{type_emoji} {item['type']}")
+            
+            # Condición
+            direction_emoji = "↗️" if item["direction"] == AlertDirection.ABOVE.value else "↘️"
+            cols[2].markdown(f"{direction_emoji} ${item['target']:.2f}")
+            
+            # Precio actual
+            if item.get("last_price") is not None:
+                cols[3].markdown(f"${item['last_price']:.2f}")
+            else:
+                cols[3].markdown("⏳ Cargando...")
+            
+            # Cambio 24h
+            if item.get("change_24h") is not None:
+                change = item["change_24h"]
+                color = "🟢" if change >= 0 else "🔴"
+                cols[4].markdown(f"{color} {change:.2f}%")
+            else:
+                cols[4].markdown("─")
+            
+            # Estado
+            if item.get("error"):
+                cols[5].markdown("❌ Error")
+            elif item.get("triggered", False):
+                cols[5].markdown("🔔 Disparada")
+            else:
+                cols[5].markdown("🟢 Activa")
+            
+            # Última actualización
+            if item.get("last_update"):
+                try:
+                    last_update = datetime.fromisoformat(item["last_update"])
+                    cols[6].markdown(last_update.strftime("%H:%M:%S"))
+                except:
+                    cols[6].markdown("─")
+            else:
+                cols[6].markdown("─")
+            
+            # Acciones
+            col_reset, col_delete = cols[7].columns(2)
+            
+            # Encontrar índice real en watchlist original
+            real_idx = next(i for i, orig_item in enumerate(watchlist) if orig_item["symbol"] == item["symbol"])
+            
+            if item.get("triggered", False) and col_reset.button("🔄", key=f"reset_{real_idx}", help="Reactivar alerta"):
+                watchlist[real_idx]["triggered"] = False
+                watchlist[real_idx].pop("triggered_at", None)
+                save_json(WATCHLIST_PATH, watchlist)
+                st.rerun()
+            
+            if col_delete.button("🗑️", key=f"delete_{real_idx}", help="Eliminar"):
+                del watchlist[real_idx]
+                save_json(WATCHLIST_PATH, watchlist)
+                st.rerun()
     
-    # Para la eliminación, Streamlit maneja el estado de los botones.
-    # La forma correcta es tener un botón de "confirmar eliminación" o
-    # manejar la eliminación en el mismo bucle si la lista se recrea,
-    # lo cual es lo que hacemos con `items_to_keep`.
+    else:
+        st.info("No hay activos que coincidan con los filtros aplicados.")
     
-    # Si un botón de eliminar fue presionado, el `idx` se recordaría.
-    # Necesitamos una forma más robusta de saber cuál fue presionado.
-    # Por ahora, nos quedamos con el método simple de "reconstruir la lista".
+    # Acciones masivas
+    st.markdown("---")
+    col1, col2, col3 = st.columns([1, 1, 2])
     
-    # El método actual de eliminación dentro del bucle `for idx, it in enumerate(watchlist):`
-    # puede causar problemas de "skip" si se eliminan elementos mientras se itera.
-    # Una mejor práctica es recopilar los índices a eliminar y luego eliminarlos, o
-    # simplemente recrear la lista sin los elementos a eliminar.
-
-    # En este caso, el `del watchlist[idx]` está en el bucle. Para Streamlit,
-    # esto puede ser problemático si el usuario presiona múltiples botones de eliminación
-    # rápidamente. La forma más robusta sería:
-
-    # En lugar de `del watchlist[idx]`, se debe reconstruir la lista después del bucle
-    # para que Streamlit maneje correctamente los cambios de estado.
+    with col1:
+        if st.button("🔄 Reactivar Todas"):
+            for item in watchlist:
+                item["triggered"] = False
+                item.pop("triggered_at", None)
+            save_json(WATCHLIST_PATH, watchlist)
+            st.success("Todas las alertas reactivadas")
+            st.rerun()
     
-    # Para el ejemplo actual, la línea `del watchlist[idx]` funcionará,
-    # pero es importante entender que puede no ser la más eficiente o robusta
-    # en escenarios complejos de UI con muchos botones de eliminación.
-    # Mantendremos `del watchlist[idx]` para simplicidad y porque Streamlit
-    # refresca la página, lo que mitiga algunos problemas.
+    with col2:
+        if st.button("🗑️ Limpiar Lista"):
+            if st.session_state.get("confirm_clear"):
+                watchlist.clear()
+                save_json(WATCHLIST_PATH, watchlist)
+                st.success("Lista limpiada")
+                st.session_state["confirm_clear"] = False
+                st.rerun()
+            else:
+                st.session_state["confirm_clear"] = True
+                st.warning("Presiona nuevamente para confirmar")
 
 else:
-    st.info("No hay activos en la lista de seguimiento. ¡Agrega uno arriba!")
+    st.info("🚀 ¡Agrega tu primer activo para comenzar!")
+
+# ---------- Footer ----------
+st.markdown("---")
+st.markdown("*Price Alerts Pro - Monitoreo inteligente de precios*")
