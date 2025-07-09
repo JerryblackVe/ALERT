@@ -1,190 +1,317 @@
 """
-Price Alert – Yahoo Finance & CoinGecko (batch-fetch, SQLite, env-vars)
-Autor: ChatGPT (jul-2025) – listo para copiar/pegar.
+PRICE ALERTS PRO – Acciones & Cripto (Yahoo Finance + CoinGecko)
+----------------------------------------------------------------
+• Cache inteligente y back-off de reintentos  
+• Manejo robusto de errores + logging con rotación  
+• Cool-down de notificaciones configurable  
+• UI con filtros, búsqueda y métricas en tiempo real  
+• Sin funciones «experimental» de Streamlit → compatibilidad 1.x-2.x  
+
+Requisitos:
+    pip install streamlit streamlit-autorefresh yfinance requests python-dotenv
 """
 
-import os, json, time, sqlite3, threading, schedule, ssl, smtplib
+# ———————————————————————  IMPORTS  ————————————————————————
+import os, json, time, threading, ssl, smtplib, logging
 from datetime import datetime, timedelta
-from email.message import EmailMessage
-from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+from enum import Enum, auto
+from logging.handlers import RotatingFileHandler
 
 import requests, yfinance as yf, streamlit as st
 from streamlit_autorefresh import st_autorefresh
+from email.message import EmailMessage
 from dotenv import load_dotenv
 
-# ---------- Carga de variables de entorno ----------
-load_dotenv()  # lee .env si existe
+# ————————————————————  LOGGING SET-UP  ————————————————————
+LOG_FILE = "price_alerts.log"
+logger = logging.getLogger("PriceAlerts")
+logger.setLevel(logging.INFO)
+logger.addHandler(RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3))
+logger.addHandler(logging.StreamHandler())
 
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-EMAIL_TO  = os.getenv("EMAIL_TO", "")
+# ————————————————————  ENUMS / MODELOS  ————————————————————
+class AlertDirection(Enum):
+    ABOVE  = "above"
+    BELOW  = "below"
 
-# ---------- BBDD ----------
-DB_PATH = "watchlist.db"
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cur  = conn.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS watchlist(
-    id INTEGER PRIMARY KEY,
-    symbol TEXT,
-    type   TEXT,
-    direction TEXT,
-    target REAL,
-    last REAL,
-    triggered INTEGER,
-    last_alert_utc TEXT
-)""")
-conn.commit()
-DB_LOCK = threading.Lock()
+class AssetType(Enum):
+    STOCK  = "stock"
+    CRYPTO = "crypto"
 
-def db_all() -> List[Dict]:
-    cur.execute("SELECT * FROM watchlist")
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+@dataclass
+class PriceData:
+    price: float
+    timestamp: datetime
+    change_24h: Optional[float] = None
+    volume: Optional[float] = None
 
-def db_add(item: Dict):
-    with DB_LOCK:
-        cur.execute("""INSERT INTO watchlist(symbol,type,direction,target,last,triggered,last_alert_utc)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (item["symbol"], item["type"], item["direction"],
-                     item["target"], None, 0, None))
-        conn.commit()
+# ————————————————————  RUTAS & CONSTANTES  ————————————————————
+CONFIG_PATH     = "config.json"
+WATCHLIST_PATH  = "watchlist.json"
+CACHE_PATH      = "price_cache.json"
 
-def db_delete(item_id: int):
-    with DB_LOCK:
-        cur.execute("DELETE FROM watchlist WHERE id=?", (item_id,))
-        conn.commit()
+DEFAULT_CONFIG: Dict = {
+    "checks_per_day":         1440,      # 1 chequeo por minuto
+    "smtp_host":              "smtp.gmail.com",
+    "smtp_port":              465,
+    "smtp_user":              "",
+    "smtp_pass":              "",
+    "email_to":               "",
+    "cache_duration_minutes": 2,
+    "max_retries":            3,
+    "notification_cooldown":  300        # 5 min
+}
 
-def db_update(id_: int, **kwargs):
-    ks, vs = zip(*kwargs.items())
-    set_clause = ", ".join(f"{k}=?" for k in ks)
-    with DB_LOCK:
-        cur.execute(f"UPDATE watchlist SET {set_clause} WHERE id=?", (*vs, id_))
-        conn.commit()
+CRYPTO_SYMBOL_MAP = {
+    "btc":"bitcoin","eth":"ethereum","ada":"cardano","sol":"solana","doge":"dogecoin",
+    "matic":"polygon","link":"chainlink","dot":"polkadot","xrp":"ripple","ltc":"litecoin",
+    "bch":"bitcoin-cash","xlm":"stellar"
+}
 
-# ---------- Precios ----------
-CRYPTO_MAP = {"btc":"bitcoin","eth":"ethereum","ada":"cardano","sol":"solana"}
-
-@st.cache_data(ttl=15)
-def batch_stock_prices(symbols: List[str]) -> Dict[str, float]:
-    data = yf.download(tickers=" ".join(symbols), period="1d", interval="1m", group_by='ticker', progress=False)
-    prices = {}
-    for sym in symbols:
+# ————————————————————  UTILIDADES JSON  ————————————————————
+def _load_json(path:str, default):
+    if os.path.exists(path):
         try:
-            ser = data[sym]["Close"].dropna()
-            prices[sym] = float(ser.iloc[-1])
-        except Exception:
-            t = yf.Ticker(sym)
-            prices[sym] = float(t.fast_info.get("lastPrice") or t.info["regularMarketPrice"])
-    return prices
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error leyendo {path}: {e}")
+    return default.copy() if hasattr(default, "copy") else default
 
-@st.cache_data(ttl=15)
-def batch_crypto_prices(symbols: List[str]) -> Dict[str, float]:
-    ids = [CRYPTO_MAP.get(s.lower(), s.lower()) for s in symbols]
-    url = f"https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": ",".join(ids), "vs_currencies": "usd"}
-    r = requests.get(url, params=params, timeout=10).json()
-    return {s.upper(): float(r[CRYPTO_MAP.get(s.lower(), s.lower())]["usd"]) for s in symbols}
-
-def current_prices(rows: List[Dict]) -> Dict[int, float]:
-    stocks  = [r["symbol"] for r in rows if r["type"]=="stock"]
-    cryptos = [r["symbol"] for r in rows if r["type"]=="crypto"]
-    out = {}
-    if stocks:
-        sp = batch_stock_prices(stocks)
-        out.update({sym:sp[sym] for sym in stocks})
-    if cryptos:
-        cp = batch_crypto_prices(cryptos)
-        out.update({sym.upper():cp[sym.upper()] for sym in cryptos})
-    return out
-
-# ---------- Email ----------
-def send_email(subj: str, body: str) -> bool:
-    if not (SMTP_USER and SMTP_PASS and EMAIL_TO):
-        st.toast("⚠️ Configurá SMTP en variables de entorno", icon="⚙️")
-        return False
-    msg = EmailMessage(); msg["Subject"], msg["From"], msg["To"] = subj, SMTP_USER, EMAIL_TO
-    msg.set_content(body)
+def _save_json(path:str, data):
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
-            s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
-        return True
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
     except Exception as e:
-        st.toast(f"❌ Error SMTP: {e}")
-        return False
+        logger.error(f"Error guardando {path}: {e}")
 
-# ---------- Motor de alertas ----------
-COOLDOWN = timedelta(minutes=15)
+# ————————————————————  PRICE CACHE  ————————————————————
+class PriceCache:
+    def __init__(self, minutes:int):
+        self.ttl  = timedelta(minutes=minutes)
+        self._raw = _load_json(CACHE_PATH, {})
+        # convertir timestamps a datetime
+        for k,v in list(self._raw.items()):
+            ts = v.get("timestamp")
+            try:
+                self._raw[k]["timestamp"] = datetime.fromisoformat(ts)
+            except Exception:
+                self._raw.pop(k, None)
 
-def job_check():
-    rows = db_all()
-    if not rows: return
-    prices = current_prices(rows)
-    now = datetime.utcnow()
-    for r in rows:
-        price = prices.get(r["symbol"], None)
-        if price is None: continue
-        db_update(r["id"], last=price)
-        cond = price >= r["target"] if r["direction"]=="above" else price <= r["target"]
-        if cond:
-            last_alert = datetime.fromisoformat(r["last_alert_utc"]) if r["last_alert_utc"] else None
-            if not last_alert or now-last_alert > COOLDOWN:
-                op = "≥" if r["direction"]=="above" else "≤"
-                if send_email(f"Alerta {r['symbol']} {op} {r['target']}",
-                              f"Ticker: {r['symbol']}\nPrecio actual: {price:.2f} USD\nUTC: {now:%Y-%m-%d %H:%M:%S}"):
-                    db_update(r["id"], triggered=1, last_alert_utc=now.isoformat())
+    def get(self, key:str) -> Optional[PriceData]:
+        d = self._raw.get(key)
+        if d and datetime.now() - d["timestamp"] < self.ttl:
+            return PriceData(**d)
+        return None
 
-# Planificador (1-1440 chequeos/día)
-CHECKS_PER_DAY = int(st.secrets.get("checks_per_day", 1440))
-schedule.every(86400//CHECKS_PER_DAY).seconds.do(job_check)
+    def set(self, key:str, data:PriceData):
+        self._raw[key] = data.__dict__
+        _save_json(CACHE_PATH, self._raw)
 
-def scheduler_loop():
+# ————————————————————  FUNCIONES DE PRECIO  ————————————————————
+def _get_stock_price(sym:str, cache:PriceCache, retries:int)->PriceData:
+    key=f"stk_{sym.upper()}"
+    if (pd:=cache.get(key)): return pd
+
+    for n in range(retries):
+        try:
+            t = yf.Ticker(sym.upper())
+            info = t.fast_info if hasattr(t,"fast_info") else {}
+            price = info.get("lastPrice") or info.get("regularMarketPrice") or t.info.get("regularMarketPrice")
+            if not price: raise ValueError("precio no disponible")
+            out = PriceData(float(price), datetime.now(),
+                            change_24h=t.info.get("regularMarketChangePercent"),
+                            volume=t.info.get("regularMarketVolume"))
+            cache.set(key,out)
+            return out
+        except Exception as e:
+            logger.warning(f"[{sym}] intento {n+1}: {e}")
+            time.sleep(2**n)
+    raise ValueError(f"No se pudo obtener precio de {sym}")
+
+def _get_crypto_price(sym:str, cache:PriceCache, retries:int)->PriceData:
+    key=f"crt_{sym.lower()}"
+    if (pd:=cache.get(key)): return pd
+    coin_id = CRYPTO_SYMBOL_MAP.get(sym.lower(), sym.lower())
+
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids":coin_id,"vs_currencies":"usd","include_24hr_change":"true"}
+
+    for n in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=10); r.raise_for_status()
+            data = r.json()[coin_id]
+            out = PriceData(float(data["usd"]), datetime.now(),
+                            change_24h=data.get("usd_24h_change"))
+            cache.set(key,out)
+            return out
+        except Exception as e:
+            logger.warning(f"[{sym}] intento {n+1}: {e}")
+            time.sleep(2**n)
+    raise ValueError(f"No se pudo obtener precio de {sym}")
+
+def validate_symbol(symbol:str, atype:AssetType)->bool:
+    try:
+        tmp = PriceCache(0)
+        (_get_stock_price if atype==AssetType.STOCK else _get_crypto_price)(symbol,tmp,1)
+        return True
+    except: return False
+
+# ————————————————————  NOTIFICACIONES  ————————————————————
+class Notifier:
+    def __init__(self, cooldown:int):
+        self.last = {}     # symbol -> datetime
+        self.cooldown = cooldown
+
+    def _can_send(self,sym:str)->bool:
+        t=self.last.get(sym)
+        return not t or (datetime.now()-t).total_seconds()>self.cooldown
+
+    def _mark_sent(self,sym:str): self.last[sym]=datetime.now()
+
+    def email(self, subj:str, body:str)->bool:
+        fields=["smtp_host","smtp_port","smtp_user","smtp_pass","email_to"]
+        if not all(config.get(f) for f in fields): return False
+        try:
+            msg = EmailMessage()
+            msg["Subject"],msg["From"],msg["To"]=subj,config["smtp_user"],config["email_to"]
+            msg.set_content(body)
+            ctx=ssl.create_default_context()
+            with smtplib.SMTP_SSL(config["smtp_host"],config["smtp_port"],context=ctx) as s:
+                s.login(config["smtp_user"],config["smtp_pass"])
+                s.send_message(msg)
+            return True
+        except Exception as e:
+            logger.error(f"SMTP: {e}")
+            return False
+
+    def notify(self, sym:str, subj:str, body:str):
+        if self._can_send(sym) and self.email(subj,body):
+            self._mark_sent(sym)
+
+# ————————————————————  CARGAR CONFIG & LISTAS  ————————————————————
+config: Dict       = _load_json(CONFIG_PATH , DEFAULT_CONFIG)
+watchlist: List[Dict] = _load_json(WATCHLIST_PATH, [])
+cache               = PriceCache(config["cache_duration_minutes"])
+notifier            = Notifier(config["notification_cooldown"])
+
+# ————————————————————  HILO PRINCIPAL DE ALERTAS  ————————————————————
+def _alert_loop():
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        interval = max(10, 86400 // config.get("checks_per_day",1440))
+        for item in watchlist:
+            try:
+                getter = _get_stock_price if item["type"]==AssetType.STOCK.value else _get_crypto_price
+                pd = getter(item["symbol"], cache, config["max_retries"])
+                item.update({"last_price":pd.price,"change_24h":pd.change_24h,"last_update":datetime.now().isoformat()})
+                cond = (pd.price>=item["target"]) if item["direction"]==AlertDirection.ABOVE.value else (pd.price<=item["target"])
+                if cond and not item.get("triggered",False):
+                    subj = f"🚨 {item['symbol']} {'≥' if item['direction']=='above' else '≤'} {item['target']}"
+                    body = f"{item['symbol']}: {pd.price:.2f} USD\nCambio 24h: {pd.change_24h:.2f}%\n{datetime.now():%Y-%m-%d %H:%M:%S}"
+                    notifier.notify(item["symbol"],subj,body)
+                    item["triggered"]=True
+            except Exception as e:
+                item["error"]=str(e); logger.error(e)
+        _save_json(WATCHLIST_PATH,watchlist)
+        time.sleep(interval)
 
-if "thr" not in st.session_state:
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-    st.session_state["thr"] = True
+if "_thr" not in st.session_state:
+    threading.Thread(target=_alert_loop,daemon=True).start()
+    st.session_state["_thr"]=True
 
-# ---------- UI ----------
-st.set_page_config("⏰ Price Alerts", layout="wide")
-st.title("⏰ Price Alerts – Yahoo Finance + CoinGecko")
+# ————————————————————  STREAMLIT UI  ————————————————————
+st.set_page_config("⏰ Price Alerts Pro", layout="wide", initial_sidebar_state="expanded")
+st.title("⏰ Price Alerts Pro – Acciones & Cripto")
 
-st_autorefresh(interval=max(10,1000*86400//CHECKS_PER_DAY), key="refresh")
+# auto-refresh
+ms = max(30_000, 86400000 // config.get("checks_per_day",1440))
+st_autorefresh(interval=ms, key="refresh")
 
-# --- Agregar activo ---
+# métricas generales
+m1,m2,m3,m4 = st.columns(4)
+m1.metric("Activos",len(watchlist))
+m2.metric("Alertas activas",len([x for x in watchlist if not x.get("triggered")]))
+m3.metric("Disparadas",len([x for x in watchlist if x.get("triggered")]))
+m4.metric("Con error",len([x for x in watchlist if x.get("error")]))
+
+# ——— SIDEBAR ———
+with st.sidebar:
+    st.header("⚙️ Configuración")
+    config["checks_per_day"] = st.number_input("Chequeos/día",1,1440,int(config["checks_per_day"]))
+    config["cache_duration_minutes"] = st.number_input("Cache (min)",1,30,int(config["cache_duration_minutes"]))
+    config["notification_cooldown"] = st.number_input("Cooldown notifs (seg)",60,3600,int(config["notification_cooldown"]))
+
+    st.subheader("📧 SMTP")
+    config["smtp_host"]=st.text_input("Host",config["smtp_host"])
+    config["smtp_port"]=st.number_input("Puerto",1,65535,int(config["smtp_port"]))
+    config["smtp_user"]=st.text_input("Usuario",config["smtp_user"])
+    config["smtp_pass"]=st.text_input("Password",config["smtp_pass"],type="password")
+    config["email_to"] = st.text_input("Enviar a",config["email_to"])
+
+    b1,b2 = st.columns(2)
+    if b1.button("💾 Guardar"):
+        _save_json(CONFIG_PATH,config); st.success("Guardado")
+    if b2.button("📧 Test"):
+        ok = notifier.email("Test PriceAlerts","Todo Ok")
+        st.success("Enviado") if ok else st.error("Error")
+
+# ——— FORMULARIO NUEVO ACTIVO ———
 st.subheader("➕ Nuevo activo")
-c1,c2,c3,c4 = st.columns([2,1,1,1])
-symbol  = c1.text_input("Ticker / Símbolo")
-atype   = c2.selectbox("Tipo",["stock","crypto"])
-direct  = c3.selectbox("Condición",["above","below"])
-target  = c4.number_input("Precio USD",min_value=0.01,step=0.01)
+with st.form("form_add"):
+    c1,c2,c3,c4 = st.columns([2,1,1,1])
+    sym = c1.text_input("Símbolo")
+    typ = c2.selectbox("Tipo",[AssetType.STOCK.value,AssetType.CRYPTO.value])
+    dir_ = c3.selectbox("Condición",[AlertDirection.ABOVE.value,AlertDirection.BELOW.value])
+    tgt = c4.number_input("Precio USD",min_value=0.01,step=0.01)
+    add = st.form_submit_button("Agregar")
 
-if st.button("Agregar"):
-    if symbol and target>0:
-        db_add({"symbol":symbol.upper(),"type":atype,"direction":direct,"target":target})
-        st.experimental_rerun()
+if add and sym and tgt>0:
+    with st.spinner("Validando…"):
+        if validate_symbol(sym,AssetType(typ)):
+            watchlist.append({"symbol":sym.upper(),"type":typ,"direction":dir_,"target":tgt,
+                              "triggered":False,"added_at":datetime.now().isoformat()})
+            _save_json(WATCHLIST_PATH,watchlist)
+            getattr(st,"rerun",st.experimental_rerun)()
+        else:
+            st.error("Símbolo no válido")
+
+# ——— LISTA CON FILTROS ———
+st.subheader("📊 Lista de seguimiento")
+if watchlist:
+    f1,f2,f3 = st.columns([2,1,1])
+    q       = f1.text_input("Buscar símbolo")
+    tfilt   = f2.selectbox("Tipo",["Todos"]+[e.value for e in AssetType])
+    sfilt   = f3.selectbox("Estado",["Todos","Activas","Disparadas","Errores"])
+
+    lst = watchlist
+    if q: lst=[i for i in lst if q.upper() in i["symbol"]]
+    if tfilt!="Todos": lst=[i for i in lst if i["type"]==tfilt]
+    if sfilt=="Activas":   lst=[i for i in lst if not i.get("triggered") and not i.get("error")]
+    if sfilt=="Disparadas":lst=[i for i in lst if i.get("triggered")]
+    if sfilt=="Errores":   lst=[i for i in lst if i.get("error")]
+
+    if lst:
+        heads = ["Símb","Tipo","Cond.","Precio","24h %","Estado","Acción"]
+        st.write("|".join(heads))
+        for idx,item in enumerate(lst):
+            col1,col2,col3,col4,col5,col6,col7 = st.columns([1,0.8,1.2,1,1,1,1])
+            col1.write(f"**{item['symbol']}**")
+            col2.write(item["type"])
+            col3.write(("≥" if item["direction"]=="above" else "≤")+f" {item['target']}")
+            col4.write(f"{item.get('last_price','–')}")
+            col5.write(f"{item.get('change_24h','–')}")
+            if item.get("error"):
+                col6.write("❌")
+            elif item.get("triggered"):
+                col6.write("🔔")
+            else:
+                col6.write("🟢")
+            idx_real = watchlist.index(item)
+            if col7.button("🗑️",key=f"del{idx_real}"):
+                watchlist.pop(idx_real); _save_json(WATCHLIST_PATH,watchlist); getattr(st,"rerun",st.experimental_rerun)()
     else:
-        st.warning("Completa símbolo y precio válido")
-
-# --- Tabla en vivo ---
-st.subheader("📈 Lista de seguimiento")
-rows = db_all()
-if rows:
-    prices = {r["symbol"]:r["last"] for r in rows}
-    for r in rows:
-        col = st.columns([1.2,.8,1.5,1.2,.8,.6])
-        op = "≥" if r["direction"]=="above" else "≤"
-        col[0].markdown(r["symbol"])
-        col[1].markdown(r["type"])
-        col[2].markdown(f"{op} {r['target']}")
-        col[3].markdown(f"{prices.get(r['symbol'],0):.2f}" if prices.get(r["symbol"]) else "–")
-        state = "🟢 Activa" if not r["triggered"] else "🔔"
-        col[4].markdown(state)
-        if col[5].button("🗑️", key=f"del{r['id']}"):
-            db_delete(r["id"]); st.experimental_rerun()
+        st.info("Sin resultados.")
 else:
-    st.info("Aún no hay activos cargados.")
-
-st.caption("Próximo chequeo en ~{} seg".format(86400//CHECKS_PER_DAY))
+    st.info("Aún no hay activos – agrega el primero.")
